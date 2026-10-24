@@ -9,9 +9,16 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "DEIN_BOT_TOKEN_HIER")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "DEINE_CHAT_ID_HIER")
 
 MAX_PRICE = 2400.00
-MIN_PRICE = 1850.00  # Schutz vor Hüllen, Dummys und offensichtlichen Fake-Inseraten
-MPN = "MK2D4ZD/A"    # Offizielle Apple-Teilenummer für 256GB Sternenweiß (DE)
-PLZ_APPLE_PICKUP = "86150"  # Prüft Apple Stores im Umkreis (Augsburg & München)
+MIN_PRICE = 1850.00      # Schutz vor Hüllen, Dummys und Fake-Inseraten bei Sofort-Kaufen
+MIN_PRICE_AUCTION = 500.00  # Niedrigerer Startfilter für laufende Auktionen (< 24h)
+
+# Unterstützte Herstellernummern für iPhone Duo 256GB Sternenweiß
+MPNS = ["MK2D4ZD/A", "MK2D4QL/A", "MK2D4SX/A"]
+
+# Postleitzahlen für Apple-API (deckt Augsburg, beide Münchner Stores und Stuttgart ab)
+APPLE_SEARCH_LOCATIONS = ["86150", "70173"]
+# Strikter Filter: Nur diese Städte/Stores dürfen einen Alarm auslösen
+ALLOWED_APPLE_STORES = ["augsburg", "city-galerie", "münchen", "rosenstraße", "oez", "olympia", "stuttgart", "sindelfingen"]
 
 SEEN_FILE = "seen_offers.json"
 HEADERS = {
@@ -19,7 +26,10 @@ HEADERS = {
     "Accept-Language": "de-DE,de;q=0.9"
 }
 
-BLACKLIST = ["hülle", "case", "folie", "panzerglas", "defekt", "suche", "tausche", "verpackung", "ovp leer", "dummy", "nachthimmel", "night sky"]
+BLACKLIST = [
+    "hülle", "case", "folie", "panzerglas", "defekt", "suche", "tausche",
+    "verpackung", "ovp leer", "leere ovp", "dummy", "nachthimmel", "night sky", "reparatur"
+]
 # =================================================
 
 def load_seen():
@@ -46,45 +56,61 @@ def send_telegram(message):
         print(f"Telegram-Fehler: {e}")
 
 def parse_price(price_str):
-    # Entfernt Punkte (Tausendertrennzeichen) und wandelt Komma in Punkt um
-    clean = re.sub(r"[^\d,]", "", price_str).replace(",", ".")
+    # Bei Preisspannen ("1.900,00 € bis 2.300,00 €") nur den ersten Preis nehmen
+    first_part = price_str.split("bis")[0]
+    clean = re.sub(r"[^\d,]", "", first_part).replace(",", ".")
     try:
         return float(clean)
     except ValueError:
         return None
 
 def check_apple_store_pickup(seen):
-    """Prüft die offizielle Apple Fulfillment API auf Same-Day-Pickup in Augsburg & München."""
-    url = f"https://www.apple.com/de/shop/fulfillment-messages?pl=true&mts.0=regular&parts.0={MPN}&location={PLZ_APPLE_PICKUP}"
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=12)
-        if r.status_code == 200:
+    """Prüft die offizielle Apple Fulfillment API strikt für Augsburg, München und Stuttgart."""
+    parts_query = "&".join([f"parts.{i}={ requests.utils.quote(mpn) }" for i, mpn in enumerate(MPNS)])
+
+    for plz in APPLE_SEARCH_LOCATIONS:
+        url = f"https://www.apple.com/de/shop/fulfillment-messages?pl=true&mts.0=regular&{parts_query}&location={plz}"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=12)
+            if r.status_code != 200:
+                continue
+
             data = r.json()
             stores = data.get("body", {}).get("content", {}).get("pickupMessage", {}).get("stores", [])
-            for store in stores:
-                store_name = store.get("storeName", "Apple Store")
-                part_info = store.get("partsAvailability", {}).get(MPN, {})
-                pickup_display = part_info.get("pickupDisplay", "unavailable")
-                pickup_quote = part_info.get("pickupSearchQuote", "")
 
-                if pickup_display == "available":
-                    offer_id = f"apple_{store_name}_{pickup_quote}"
-                    if offer_id not in seen:
-                        msg = (
-                            f"🍏 <b>APPLE STORE ALARM ({store_name})</b>\n"
-                            f"Modell: iPhone Duo 256 GB Sternenweiß\n"
-                            f"Status: <b>{pickup_quote} (Sofort abholbar!)</b>\n"
-                            f"Preis: 2.299,00 €\n"
-                            f"👉 <a href='https://www.apple.com/de/shop/buy-iphone/iphone-duo'>Jetzt in der Apple Store App reservieren</a>"
-                        )
-                        send_telegram(msg)
-                        seen.add(offer_id)
-    except Exception as e:
-        print(f"Apple API Check übersprungen: {e}")
+            for store in stores:
+                store_name = store.get("storeName", "")
+                city = store.get("city", "")
+                combined_location = f"{store_name} {city}".lower()
+
+                # Strikter Filter auf Augsburg, München und Stuttgart
+                if not any(allowed in combined_location for allowed in ALLOWED_APPLE_STORES):
+                    continue
+
+                parts_avail = store.get("partsAvailability", {})
+                for mpn in MPNS:
+                    part_info = parts_avail.get(mpn, {})
+                    pickup_display = part_info.get("pickupDisplay", "unavailable")
+                    pickup_quote = part_info.get("pickupSearchQuote", "Sofort verfügbar")
+
+                    if pickup_display == "available":
+                        offer_id = f"apple_{store_name}_{mpn}_{pickup_quote}"
+                        if offer_id not in seen:
+                            msg = (
+                                f"🍏 <b>APPLE STORE PICKUP VERFÜGBAR!</b>\n"
+                                f"Store: <b>Apple {store_name} ({city})</b>\n"
+                                f"Modell: iPhone Duo 256 GB Sternenweiß ({mpn})\n"
+                                f"Status: <b>{pickup_quote}</b>\n"
+                                f"Preis: 2.299,00 €\n"
+                                f"👉 <a href='https://www.apple.com/de/shop/buy-iphone/iphone-duo'>Jetzt direkt reservieren</a>"
+                            )
+                            send_telegram(msg)
+                            seen.add(offer_id)
+        except Exception as e:
+            print(f"Apple API Check Fehler ({plz}): {e}")
 
 def check_geizhals_shops(seen):
-    """Prüft alle deutschen Online-Shops (MediaMarkt, Saturn, Cyberport, Galaxus, o2 etc.) auf Lagerbestand <= 2400€."""
-    # Geizhals-Produktseite für Apple iPhone Duo 256GB Sternenweiß (ID: a3936870) mit Filter "Lagernd / Kurzfristig"
+    """Prüft alle deutschen Online-Shops via Geizhals auf sofortigen Lagerbestand <= 2400€."""
     url = "https://geizhals.de/apple-iphone-duo-256gb-sternenweiss-a3936870.html?t=v&vl=de&va=b"
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
@@ -105,7 +131,6 @@ def check_geizhals_shops(seen):
             avail_text = avail_elem.get_text(" ", strip=True).lower()
             link = "https://geizhals.de" + link_elem["href"] if link_elem and link_elem.get("href") else url
 
-            # Prüfe ob sofort/kurzfristig lieferbar (schließt "ab 09.11.", "Januar", "unbestimmt" aus)
             is_in_stock = any(k in avail_text for k in ["lagernd", "sofort", "1-2 werktage", "1-3 werktage", "2-3 werktage", "auf lager"])
             is_delayed = any(b in avail_text for b in ["wochen", "monat", "2027", "unbestimmt", "vorbestell"])
 
@@ -116,8 +141,8 @@ def check_geizhals_shops(seen):
                         f"🛒 <b>SHOP-BESTAND GEFUNDEN: {shop}</b>\n"
                         f"Modell: iPhone Duo 256 GB Sternenweiß\n"
                         f"Preis: <b>{price:.2f} €</b>\n"
-                        f"Lieferstatus: {avail_elem.get_text(' ', strip=True)}\n"
-                        f"👉 <a href='{link}'>Direkt zum Angebot</a>"
+                        f"Status: {avail_elem.get_text(' ', strip=True)}\n"
+                        f"👉 <a href='{link}'>Direkt zum Shop</a>"
                     )
                     send_telegram(msg)
                     seen.add(offer_id)
@@ -142,8 +167,7 @@ def check_kleinanzeigen(seen):
                 continue
 
             title = title_elem.get_text(strip=True)
-            title_lower = title.lower()
-            if any(bad in title_lower for bad in BLACKLIST):
+            if any(bad in title.lower() for bad in BLACKLIST):
                 continue
 
             price = parse_price(price_elem.get_text(strip=True))
@@ -160,7 +184,7 @@ def check_kleinanzeigen(seen):
                     f"Titel: {title}\n"
                     f"Preis: <b>{price:.2f} €</b>\n"
                     f"Ort: {location}\n"
-                    f"⚠️ <i>Hinweis: Bei Privatkauf nur Abholung mit Original-Rechnung!</i>\n"
+                    f"⚠️ <i>Hinweis: Nur Abholung mit Original-Rechnung!</i>\n"
                     f"👉 <a href='{link}'>Zur Anzeige</a>"
                 )
                 send_telegram(msg)
@@ -169,46 +193,77 @@ def check_kleinanzeigen(seen):
         print(f"Kleinanzeigen-Check Fehler: {e}")
 
 def check_ebay(seen):
-    """Prüft eBay.de Sofort-Kaufen-Angebote (Neu/Sonstige) zwischen 1.850 € und 2.400 €."""
-    url = (
-        f"https://www.ebay.de/sch/i.html?_nkw=iphone+duo+256gb+%28sternenwei%C3%9F%2C+wei%C3%9F%2C+MK2D4ZD%2FA%29+-h%C3%BClle+-case"
-        f"&_sacat=9355&LH_BIN=1&_udlo={int(MIN_PRICE)}&_udhi={int(MAX_PRICE)}&_sop=10"
-    )
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(r.text, "html.parser")
-        items = soup.select(".s-item__wrapper")
+    """
+    Prüft eBay.de getrennt nach:
+    1. Sofort-Kaufen (LH_BIN=1) bis max. 2.400 €
+    2. Auktionen (LH_Auction=1) mit Restlaufzeit < 24 Stunden (_ftrt=901&_ftrv=24) und aktuellem Preis <= 2.400 €
+    """
+    base_query = "iphone+duo+256gb+%28sternenwei%C3%9F%2C+wei%C3%9F%2C+star+white%2C+MK2D4ZD%2FA%29+-h%C3%BClle+-case+-folie"
 
-        for item in items:
-            title_elem = item.select_one(".s-item__title")
-            price_elem = item.select_one(".s-item__price")
-            link_elem = item.select_one("a.s-item__link")
+    search_modes = [
+        {
+            "type": "SOFORT-KAUFEN",
+            "emoji": "🏷️",
+            "min_p": MIN_PRICE,
+            # LH_BIN=1 (Sofort-Kaufen), _sop=10 (Neu eingestellt)
+            "url": f"https://www.ebay.de/sch/i.html?_nkw={base_query}&_sacat=9355&LH_BIN=1&_udlo={int(MIN_PRICE)}&_udhi={int(MAX_PRICE)}&_sop=10"
+        },
+        {
+            "type": "AUKTION (< 24h Restzeit)",
+            "emoji": "⏳",
+            "min_p": MIN_PRICE_AUCTION,
+            # LH_Auction=1 (Auktion), LH_Time=1&_ftrt=901&_ftrv=24 (Endet innerhalb von 24 Stunden), _sop=1 (Bald endend zuerst)
+            "url": f"https://www.ebay.de/sch/i.html?_nkw={base_query}&_sacat=9355&LH_Auction=1&LH_Time=1&_ftrt=901&_ftrv=24&_udlo={int(MIN_PRICE_AUCTION)}&_udhi={int(MAX_PRICE)}&_sop=1"
+        }
+    ]
 
-            if not (title_elem and price_elem and link_elem):
-                continue
+    for mode in search_modes:
+        try:
+            r = requests.get(mode["url"], headers=HEADERS, timeout=15)
+            soup = BeautifulSoup(r.text, "html.parser")
+            items = soup.select(".s-item__wrapper")
 
-            title = title_elem.get_text(strip=True)
-            if "Shop on eBay" in title or any(bad in title.lower() for bad in BLACKLIST):
-                continue
+            for item in items:
+                title_elem = item.select_one(".s-item__title")
+                price_elem = item.select_one(".s-item__price")
+                link_elem = item.select_one("a.s-item__link")
+                time_elem = item.select_one(".s-item__time-left")
 
-            price = parse_price(price_elem.get_text(strip=True))
-            if not price or not (MIN_PRICE <= price <= MAX_PRICE):
-                continue
+                if not (title_elem and price_elem and link_elem):
+                    continue
 
-            clean_link = link_elem["href"].split("?")[0]
-            offer_id = f"ebay_{clean_link.split('/')[-1]}"
+                title = re.sub(r"^Neues Angebot\s*", "", title_elem.get_text(strip=True), flags=re.IGNORECASE)
+                if "Shop on eBay" in title or any(bad in title.lower() for bad in BLACKLIST):
+                    continue
 
-            if offer_id not in seen:
-                msg = (
-                    f"🏷️ <b>EBAY SOFORT-KAUFEN GEFUNDEN</b>\n"
-                    f"Titel: {title}\n"
-                    f"Preis: <b>{price:.2f} €</b>\n"
-                    f"👉 <a href='{clean_link}'>Zum eBay-Angebot</a>"
-                )
-                send_telegram(msg)
-                seen.add(offer_id)
-    except Exception as e:
-        print(f"eBay-Check Fehler: {e}")
+                price = parse_price(price_elem.get_text(strip=True))
+                if not price or not (mode["min_p"] <= price <= MAX_PRICE):
+                    continue
+
+                time_left = time_elem.get_text(strip=True) if time_elem else "Sofort verfügbar"
+
+                # Zusätzliche Absicherung bei Auktionen: Falls eBay doch ein Element mit "Tage" / "d" einstreut, herausfiltern
+                if mode["type"].startswith("AUKTION") and time_elem:
+                    t_low = time_left.lower()
+                    if "tag" in t_low or re.search(r"\b\d+\s*t\b", t_low):
+                        continue
+
+                clean_link = link_elem["href"].split("?")[0]
+                item_id = clean_link.split("/")[-1]
+                offer_id = f"ebay_{mode['type'][:3]}_{item_id}"
+
+                if offer_id not in seen:
+                    msg = (
+                        f"{mode['emoji']} <b>EBAY {mode['type']}</b>\n"
+                        f"Titel: {title}\n"
+                        f"Aktueller Preis: <b>{price:.2f} €</b>\n"
+                        f"Restlaufzeit: <b>{time_left}</b>\n"
+                        f"👉 <a href='{clean_link}'>Zum eBay-Angebot</a>"
+                    )
+                    send_telegram(msg)
+                    seen.add(offer_id)
+        except Exception as e:
+            print(f"eBay-Check Fehler ({mode['type']}): {e}")
 
 if __name__ == "__main__":
     seen_offers = load_seen()
