@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "DEIN_BOT_TOKEN_HIER")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "DEINE_CHAT_ID_HIER")
 
-MAX_PRICE = 2400.00
+MAX_PRICE = 2450.00
 MIN_PRICE = 1850.00      # Schutz vor Hüllen, Dummys und Fake-Inseraten bei Sofort-Kaufen
 MIN_PRICE_AUCTION = 500.00  # Niedrigerer Startfilter für laufende Auktionen (< 24h)
 
