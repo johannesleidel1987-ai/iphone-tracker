@@ -1,15 +1,18 @@
+import html
 import json
 import os
 import re
+import time
+
 import requests
 from bs4 import BeautifulSoup
 
 # ================= KONFIGURATION =================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "DEIN_BOT_TOKEN_HIER")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "DEINE_CHAT_ID_HIER")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-MAX_PRICE = 2450.00
-MIN_PRICE = 1850.00      # Schutz vor Hüllen, Dummys und Fake-Inseraten bei Sofort-Kaufen
+MAX_PRICE = 2400.00
+MIN_PRICE = 1850.00         # Schutz vor Hüllen, Dummys und Fake-Inseraten bei Sofort-Kaufen
 MIN_PRICE_AUCTION = 500.00  # Niedrigerer Startfilter für laufende Auktionen (< 24h)
 
 # Unterstützte Herstellernummern für iPhone Duo 256GB Sternenweiß
@@ -17,10 +20,22 @@ MPNS = ["MK2D4ZD/A", "MK2D4QL/A", "MK2D4SX/A"]
 
 # Postleitzahlen für Apple-API (deckt Augsburg, beide Münchner Stores und Stuttgart ab)
 APPLE_SEARCH_LOCATIONS = ["86150", "70173"]
-# Strikter Filter: Nur diese Städte/Stores dürfen einen Alarm auslösen
-ALLOWED_APPLE_STORES = ["augsburg", "city-galerie", "münchen", "rosenstraße", "oez", "olympia", "stuttgart", "sindelfingen"]
+# Abgleich nur gegen den Store-Namen (nicht die Stadt). Gefundene Stores inkl. Store-Nummer stehen im Log.
+ALLOWED_APPLE_STORES = ["augsburg", "city-galerie", "rosenstraße", "rosenstrasse", "oez", "olympia", "stuttgart"]
 
-SEEN_FILE = "seen_offers.json"
+# Kleinanzeigen: breite Suche, Farbe wird nicht im Suchbegriff erzwungen (Blacklist filtert Fremdfarben)
+KA_QUERY = "iphone-duo-256"
+
+# Titel muss alle Begriffe enthalten (Kleinanzeigen + eBay)
+REQUIRED_TITLE_TERMS = ["duo", "256"]
+
+STATE_FILE = "state.json"
+LEGACY_SEEN_FILE = "seen_offers.json"   # wird beim ersten Lauf einmalig übernommen
+SEEN_RETENTION_DAYS = 30
+
+HEALTH_FAIL_THRESHOLD = 4               # Fehlläufe in Folge bis zur Warnung (= 1 h bei 15-Min-Takt)
+HEALTH_WARN_INTERVAL = 24 * 3600        # max. eine Warnung pro Quelle und Tag
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Accept-Language": "de-DE,de;q=0.9"
@@ -32,17 +47,46 @@ BLACKLIST = [
 ]
 # =================================================
 
-def load_seen():
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    return set()
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
-def save_seen(seen):
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(seen), f)
+
+def esc(value):
+    return html.escape(str(value), quote=True)
+
+
+# ---------------- State ----------------
+
+def load_state():
+    state = {}
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    elif os.path.exists(LEGACY_SEEN_FILE):
+        with open(LEGACY_SEEN_FILE, "r", encoding="utf-8") as f:
+            legacy = json.load(f)
+        now = time.time()
+        state = {"seen": {offer_id: now for offer_id in legacy}}
+    state.setdefault("seen", {})     # offer_id -> Zeitstempel (Kleinanzeigen, eBay)
+    state.setdefault("active", {})   # Kanal -> aktuell verfügbare Treffer (Apple, Geizhals)
+    state.setdefault("health", {})   # Quelle -> Fehlerzähler
+    return state
+
+
+def save_state(state):
+    cutoff = time.time() - SEEN_RETENTION_DAYS * 86400
+    state["seen"] = {k: ts for k, ts in state["seen"].items() if ts >= cutoff}
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+
+
+# ---------------- Telegram & Health ----------------
 
 def send_telegram(message):
+    """Sendet eine Nachricht. Gibt True nur bei bestätigtem Versand zurück."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        print("Telegram nicht konfiguriert. Nachricht:\n" + message)
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -51,12 +95,54 @@ def send_telegram(message):
         "disable_web_page_preview": False
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
+        if r.ok and r.json().get("ok"):
+            return True
+        print(f"Telegram-Fehler {r.status_code}: {r.text[:300]}")
     except Exception as e:
         print(f"Telegram-Fehler: {e}")
+    return False
+
+
+def record_health(state, source, ok, detail=""):
+    h = state["health"].setdefault(source, {"fails": 0, "last_warn": 0})
+    now = time.time()
+    if ok:
+        if h["fails"] >= HEALTH_FAIL_THRESHOLD and h["last_warn"]:
+            send_telegram(f"✅ <b>Tracker: {esc(source)} funktioniert wieder</b>")
+        h["fails"] = 0
+        h["last_warn"] = 0
+        return
+    h["fails"] += 1
+    print(f"[{source}] Fehlschlag #{h['fails']}: {detail}")
+    if h["fails"] >= HEALTH_FAIL_THRESHOLD and now - h["last_warn"] >= HEALTH_WARN_INTERVAL:
+        msg = (
+            f"⚠️ <b>Tracker-Warnung: {esc(source)}</b>\n"
+            f"{h['fails']} Fehlläufe in Folge – Quelle liefert keine auswertbaren Daten "
+            f"(Blockade oder Layout-Änderung).\n"
+            f"Letzter Fehler: {esc(detail)}"
+        )
+        if send_telegram(msg):
+            h["last_warn"] = now
+
+
+def alert_once(state, offer_id, message):
+    """Für Einzelinserate: genau ein Alarm pro offer_id, gespeichert nur nach erfolgreichem Versand."""
+    if offer_id in state["seen"]:
+        return
+    if send_telegram(message):
+        state["seen"][offer_id] = time.time()
+
+
+# ---------------- Helfer ----------------
+
+def fetch(url, timeout=15):
+    r = SESSION.get(url, timeout=timeout)
+    print(f"GET {url[:100]} -> HTTP {r.status_code}")
+    return r
+
 
 def parse_price(price_str):
-    # Bei Preisspannen ("1.900,00 € bis 2.300,00 €") nur den ersten Preis nehmen
     first_part = price_str.split("bis")[0]
     clean = re.sub(r"[^\d,]", "", first_part).replace(",", ".")
     try:
@@ -64,139 +150,211 @@ def parse_price(price_str):
     except ValueError:
         return None
 
-def check_apple_store_pickup(seen):
-    """Prüft die offizielle Apple Fulfillment API strikt für Augsburg, München und Stuttgart."""
-    parts_query = "&".join([f"parts.{i}={ requests.utils.quote(mpn) }" for i, mpn in enumerate(MPNS)])
+
+def title_ok(title):
+    t = title.lower()
+    return all(term in t for term in REQUIRED_TITLE_TERMS) and not any(bad in t for bad in BLACKLIST)
+
+
+# ---------------- Apple ----------------
+
+def check_apple_store_pickup(state):
+    """Prüft die Apple Fulfillment API. Alarm nur beim Wechsel nicht verfügbar -> verfügbar."""
+    parts_query = "&".join([f"parts.{i}={requests.utils.quote(mpn)}" for i, mpn in enumerate(MPNS)])
+    observed = {}
+    errors = []
 
     for plz in APPLE_SEARCH_LOCATIONS:
         url = f"https://www.apple.com/de/shop/fulfillment-messages?pl=true&mts.0=regular&{parts_query}&location={plz}"
         try:
-            r = requests.get(url, headers=HEADERS, timeout=12)
+            r = fetch(url, timeout=12)
             if r.status_code != 200:
+                errors.append(f"PLZ {plz}: HTTP {r.status_code}")
                 continue
-
-            data = r.json()
-            stores = data.get("body", {}).get("content", {}).get("pickupMessage", {}).get("stores", [])
+            stores = r.json().get("body", {}).get("content", {}).get("pickupMessage", {}).get("stores", [])
+            if not stores:
+                errors.append(f"PLZ {plz}: keine Stores in der Antwort")
+                continue
 
             for store in stores:
                 store_name = store.get("storeName", "")
                 city = store.get("city", "")
-                combined_location = f"{store_name} {city}".lower()
+                store_number = store.get("storeNumber", "")
+                print(f"  Apple-Store: {store_name} ({city}) [{store_number}]")
 
-                # Strikter Filter auf Augsburg, München und Stuttgart
-                if not any(allowed in combined_location for allowed in ALLOWED_APPLE_STORES):
+                if not any(allowed in store_name.lower() for allowed in ALLOWED_APPLE_STORES):
                     continue
 
                 parts_avail = store.get("partsAvailability", {})
                 for mpn in MPNS:
                     part_info = parts_avail.get(mpn, {})
-                    pickup_display = part_info.get("pickupDisplay", "unavailable")
-                    pickup_quote = part_info.get("pickupSearchQuote", "Sofort verfügbar")
-
-                    if pickup_display == "available":
-                        offer_id = f"apple_{store_name}_{mpn}_{pickup_quote}"
-                        if offer_id not in seen:
-                            msg = (
-                                f"🍏 <b>APPLE STORE PICKUP VERFÜGBAR!</b>\n"
-                                f"Store: <b>Apple {store_name} ({city})</b>\n"
-                                f"Modell: iPhone Duo 256 GB Sternenweiß ({mpn})\n"
-                                f"Status: <b>{pickup_quote}</b>\n"
-                                f"Preis: 2.299,00 €\n"
-                                f"👉 <a href='https://www.apple.com/de/shop/buy-iphone/iphone-duo'>Jetzt direkt reservieren</a>"
-                            )
-                            send_telegram(msg)
-                            seen.add(offer_id)
+                    key = f"{store_number or store_name}|{mpn}"
+                    observed[key] = {
+                        "available": part_info.get("pickupDisplay") == "available",
+                        "store": store_name,
+                        "city": city,
+                        "mpn": mpn,
+                        "quote": part_info.get("pickupSearchQuote", "Verfügbar"),
+                    }
         except Exception as e:
-            print(f"Apple API Check Fehler ({plz}): {e}")
+            errors.append(f"PLZ {plz}: {e}")
 
-def check_geizhals_shops(seen):
-    """Prüft alle deutschen Online-Shops via Geizhals auf sofortigen Lagerbestand <= 2400€."""
+    record_health(state, "Apple", not errors, "; ".join(errors))
+
+    # Nur beobachtete Stores aktualisieren – ein Fehlschlag löscht keinen bestehenden Status
+    active = state["active"].setdefault("apple", {})
+    for key, info in observed.items():
+        if not info["available"]:
+            active.pop(key, None)
+            continue
+        if active.get(key):
+            continue
+        msg = (
+            f"🍏 <b>APPLE STORE PICKUP VERFÜGBAR!</b>\n"
+            f"Store: <b>Apple {esc(info['store'])} ({esc(info['city'])})</b>\n"
+            f"Modell: iPhone Duo 256 GB Sternenweiß ({esc(info['mpn'])})\n"
+            f"Status: <b>{esc(info['quote'])}</b>\n"
+            f"👉 <a href='https://www.apple.com/de/shop/buy-iphone/iphone-duo'>Jetzt direkt reservieren</a>"
+        )
+        if send_telegram(msg):
+            active[key] = True
+
+
+# ---------------- Geizhals ----------------
+
+def check_geizhals_shops(state):
+    """Prüft deutsche Online-Shops via Geizhals. Alarm bei neuem Bestand oder Preissenkung je Shop."""
     url = "https://geizhals.de/apple-iphone-duo-256gb-sternenweiss-a3936870.html?t=v&vl=de&va=b"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(r.text, "html.parser")
-        offers = soup.select(".offer")
-
-        for offer in offers:
-            shop_elem = offer.select_one(".merchant__logo-caption") or offer.select_one(".offer__merchant")
-            price_elem = offer.select_one(".gh_price")
-            avail_elem = offer.select_one(".offer__delivery-time")
-            link_elem = offer.select_one("a.offer__clickout")
-
-            if not (shop_elem and price_elem and avail_elem):
-                continue
-
-            shop = shop_elem.get_text(strip=True)
-            price = parse_price(price_elem.get_text(strip=True))
-            avail_text = avail_elem.get_text(" ", strip=True).lower()
-            link = "https://geizhals.de" + link_elem["href"] if link_elem and link_elem.get("href") else url
-
-            is_in_stock = any(k in avail_text for k in ["lagernd", "sofort", "1-2 werktage", "1-3 werktage", "2-3 werktage", "auf lager"])
-            is_delayed = any(b in avail_text for b in ["wochen", "monat", "2027", "unbestimmt", "vorbestell"])
-
-            if price and MIN_PRICE <= price <= MAX_PRICE and is_in_stock and not is_delayed:
-                offer_id = f"shop_{shop}_{price}"
-                if offer_id not in seen:
-                    msg = (
-                        f"🛒 <b>SHOP-BESTAND GEFUNDEN: {shop}</b>\n"
-                        f"Modell: iPhone Duo 256 GB Sternenweiß\n"
-                        f"Preis: <b>{price:.2f} €</b>\n"
-                        f"Status: {avail_elem.get_text(' ', strip=True)}\n"
-                        f"👉 <a href='{link}'>Direkt zum Shop</a>"
-                    )
-                    send_telegram(msg)
-                    seen.add(offer_id)
+        r = fetch(url)
     except Exception as e:
-        print(f"Geizhals-Check Fehler: {e}")
+        record_health(state, "Geizhals", False, str(e))
+        return
+    if r.status_code != 200:
+        record_health(state, "Geizhals", False, f"HTTP {r.status_code}")
+        return
 
-def check_kleinanzeigen(seen):
-    """Prüft Kleinanzeigen.de auf neue Inserate zwischen 1.850 € und 2.400 €."""
-    url = f"https://www.kleinanzeigen.de/s-preis:{int(MIN_PRICE)}:{int(MAX_PRICE)}/iphone-duo-256-sternenweiss/k0"
+    soup = BeautifulSoup(r.text, "html.parser")
+    offers = soup.select(".offer")
+    if not offers:
+        record_health(state, "Geizhals", False, "Keine Angebote geparst")
+        return
+    record_health(state, "Geizhals", True)
+
+    current = {}
+    for offer in offers:
+        shop_elem = offer.select_one(".merchant__logo-caption") or offer.select_one(".offer__merchant")
+        price_elem = offer.select_one(".gh_price")
+        avail_elem = offer.select_one(".offer__delivery-time")
+        link_elem = offer.select_one("a.offer__clickout")
+
+        if not (shop_elem and price_elem and avail_elem):
+            continue
+
+        shop = shop_elem.get_text(strip=True)
+        price = parse_price(price_elem.get_text(strip=True))
+        avail_display = avail_elem.get_text(" ", strip=True)
+        avail_text = avail_display.lower()
+        link = "https://geizhals.de" + link_elem["href"] if link_elem and link_elem.get("href") else url
+
+        is_in_stock = any(k in avail_text for k in ["lagernd", "sofort", "1-2 werktage", "1-3 werktage", "2-3 werktage", "auf lager"])
+        is_delayed = any(b in avail_text for b in ["wochen", "monat", "2027", "unbestimmt", "vorbestell"])
+
+        if price and MIN_PRICE <= price <= MAX_PRICE and is_in_stock and not is_delayed:
+            if shop not in current or price < current[shop]["price"]:
+                current[shop] = {"price": price, "avail": avail_display, "link": link}
+
+    active = state["active"].setdefault("geizhals", {})
+    for shop, info in current.items():
+        prev_price = active.get(shop)
+        if prev_price is not None and info["price"] >= prev_price:
+            active[shop] = info["price"]
+            continue
+        headline = "PREIS GESUNKEN" if prev_price is not None else "SHOP-BESTAND GEFUNDEN"
+        msg = (
+            f"🛒 <b>{headline}: {esc(shop)}</b>\n"
+            f"Modell: iPhone Duo 256 GB Sternenweiß\n"
+            f"Preis: <b>{info['price']:.2f} €</b>\n"
+            f"Status: {esc(info['avail'])}\n"
+            f"👉 <a href='{esc(info['link'])}'>Direkt zum Shop</a>"
+        )
+        if send_telegram(msg):
+            active[shop] = info["price"]
+
+    for shop in list(active):
+        if shop not in current:
+            del active[shop]
+
+
+# ---------------- Kleinanzeigen ----------------
+
+def check_kleinanzeigen(state):
+    """Prüft Kleinanzeigen.de auf neue Inserate zwischen MIN_PRICE und MAX_PRICE."""
+    url = f"https://www.kleinanzeigen.de/s-preis:{int(MIN_PRICE)}:{int(MAX_PRICE)}/{KA_QUERY}/k0"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(r.text, "html.parser")
-        articles = soup.select("article.aditem")
-
-        for art in articles:
-            ad_id = art.get("data-adid")
-            title_elem = art.select_one(".text-module-begin a")
-            price_elem = art.select_one(".aditem-main--middle--price-shipping--price")
-            loc_elem = art.select_one(".aditem-main--top--left")
-
-            if not (ad_id and title_elem and price_elem):
-                continue
-
-            title = title_elem.get_text(strip=True)
-            if any(bad in title.lower() for bad in BLACKLIST):
-                continue
-
-            price = parse_price(price_elem.get_text(strip=True))
-            if not price or not (MIN_PRICE <= price <= MAX_PRICE):
-                continue
-
-            link = "https://www.kleinanzeigen.de" + title_elem["href"]
-            location = loc_elem.get_text(" ", strip=True) if loc_elem else "Unbekannt"
-            offer_id = f"ka_{ad_id}"
-
-            if offer_id not in seen:
-                msg = (
-                    f"📦 <b>KLEINANZEIGEN-TREFFER (≤ 2.400 €)</b>\n"
-                    f"Titel: {title}\n"
-                    f"Preis: <b>{price:.2f} €</b>\n"
-                    f"Ort: {location}\n"
-                    f"⚠️ <i>Hinweis: Nur Abholung mit Original-Rechnung!</i>\n"
-                    f"👉 <a href='{link}'>Zur Anzeige</a>"
-                )
-                send_telegram(msg)
-                seen.add(offer_id)
+        r = fetch(url)
     except Exception as e:
-        print(f"Kleinanzeigen-Check Fehler: {e}")
+        record_health(state, "Kleinanzeigen", False, str(e))
+        return
+    if r.status_code != 200:
+        record_health(state, "Kleinanzeigen", False, f"HTTP {r.status_code}")
+        return
 
-def check_ebay(seen):
+    soup = BeautifulSoup(r.text, "html.parser")
+    articles = soup.select("article.aditem")
+    structure_ok = bool(articles) or soup.select_one("#srchrslt-content, #srchrslt-adtable") is not None
+    if not structure_ok:
+        record_health(state, "Kleinanzeigen", False, "Ergebnisliste nicht gefunden")
+        return
+    record_health(state, "Kleinanzeigen", True)
+
+    for art in articles:
+        ad_id = art.get("data-adid")
+        title_elem = art.select_one(".text-module-begin a")
+        price_elem = art.select_one(".aditem-main--middle--price-shipping--price")
+        loc_elem = art.select_one(".aditem-main--top--left")
+
+        if not (ad_id and title_elem and price_elem):
+            continue
+
+        title = title_elem.get_text(strip=True)
+        if not title_ok(title):
+            continue
+
+        price = parse_price(price_elem.get_text(strip=True))
+        if not price or not (MIN_PRICE <= price <= MAX_PRICE):
+            continue
+
+        link = "https://www.kleinanzeigen.de" + title_elem["href"]
+        location = loc_elem.get_text(" ", strip=True) if loc_elem else "Unbekannt"
+
+        msg = (
+            f"📦 <b>KLEINANZEIGEN-TREFFER (≤ {MAX_PRICE:.0f} €)</b>\n"
+            f"Titel: {esc(title)}\n"
+            f"Preis: <b>{price:.2f} €</b>\n"
+            f"Ort: {esc(location)}\n"
+            f"⚠️ <i>Hinweis: Nur Abholung mit Original-Rechnung!</i>\n"
+            f"👉 <a href='{esc(link)}'>Zur Anzeige</a>"
+        )
+        alert_once(state, f"ka_{ad_id}", msg)
+
+
+# ---------------- eBay ----------------
+
+def _first(item, selectors):
+    for sel in selectors:
+        elem = item.select_one(sel)
+        if elem:
+            return elem
+    return None
+
+
+def check_ebay(state):
     """
     Prüft eBay.de getrennt nach:
-    1. Sofort-Kaufen (LH_BIN=1) bis max. 2.400 €
-    2. Auktionen (LH_Auction=1) mit Restlaufzeit < 24 Stunden (_ftrt=901&_ftrv=24) und aktuellem Preis <= 2.400 €
+    1. Sofort-Kaufen (LH_BIN=1) bis MAX_PRICE
+    2. Auktionen (LH_Auction=1) mit Restlaufzeit < 24 Stunden und aktuellem Preis <= MAX_PRICE
+    Unterstützt das neue Karten-Layout (.s-card) und das alte Layout (.s-item).
     """
     base_query = "iphone+duo+256gb+%28sternenwei%C3%9F%2C+wei%C3%9F%2C+star+white%2C+MK2D4ZD%2FA%29+-h%C3%BClle+-case+-folie"
 
@@ -205,70 +363,90 @@ def check_ebay(seen):
             "type": "SOFORT-KAUFEN",
             "emoji": "🏷️",
             "min_p": MIN_PRICE,
-            # LH_BIN=1 (Sofort-Kaufen), _sop=10 (Neu eingestellt)
             "url": f"https://www.ebay.de/sch/i.html?_nkw={base_query}&_sacat=9355&LH_BIN=1&_udlo={int(MIN_PRICE)}&_udhi={int(MAX_PRICE)}&_sop=10"
         },
         {
             "type": "AUKTION (< 24h Restzeit)",
             "emoji": "⏳",
             "min_p": MIN_PRICE_AUCTION,
-            # LH_Auction=1 (Auktion), LH_Time=1&_ftrt=901&_ftrv=24 (Endet innerhalb von 24 Stunden), _sop=1 (Bald endend zuerst)
             "url": f"https://www.ebay.de/sch/i.html?_nkw={base_query}&_sacat=9355&LH_Auction=1&LH_Time=1&_ftrt=901&_ftrv=24&_udlo={int(MIN_PRICE_AUCTION)}&_udhi={int(MAX_PRICE)}&_sop=1"
         }
     ]
 
+    errors = []
     for mode in search_modes:
         try:
-            r = requests.get(mode["url"], headers=HEADERS, timeout=15)
+            r = fetch(mode["url"])
+            if r.status_code != 200:
+                errors.append(f"{mode['type']}: HTTP {r.status_code}")
+                continue
+
             soup = BeautifulSoup(r.text, "html.parser")
-            items = soup.select(".s-item__wrapper")
+            if soup.select_one("ul.srp-results, .srp-river-results") is None:
+                errors.append(f"{mode['type']}: Ergebnisliste nicht gefunden")
+                continue
+
+            items = soup.select("li.s-card") or soup.select("li.s-item")
+            print(f"  eBay {mode['type']}: {len(items)} Einträge")
 
             for item in items:
-                title_elem = item.select_one(".s-item__title")
-                price_elem = item.select_one(".s-item__price")
-                link_elem = item.select_one("a.s-item__link")
-                time_elem = item.select_one(".s-item__time-left")
+                title_elem = _first(item, [".s-card__title", ".s-item__title"])
+                price_elem = _first(item, [".s-card__price", ".s-item__price"])
+                link_elem = item.select_one("a[href*='/itm/']")
 
                 if not (title_elem and price_elem and link_elem):
                     continue
 
-                title = re.sub(r"^Neues Angebot\s*", "", title_elem.get_text(strip=True), flags=re.IGNORECASE)
-                if "Shop on eBay" in title or any(bad in title.lower() for bad in BLACKLIST):
+                title = title_elem.get_text(" ", strip=True)
+                title = re.sub(r"^Neues Angebot\s*", "", title, flags=re.IGNORECASE)
+                title = re.sub(r"\s*Wird in neuem Fenster oder Tab geöffnet.*$", "", title, flags=re.IGNORECASE)
+                if "Shop on eBay" in title or not title_ok(title):
                     continue
 
                 price = parse_price(price_elem.get_text(strip=True))
                 if not price or not (mode["min_p"] <= price <= MAX_PRICE):
                     continue
 
-                time_left = time_elem.get_text(strip=True) if time_elem else "Sofort verfügbar"
+                id_match = re.search(r"/itm/(?:[^/?]+/)?(\d+)", link_elem["href"])
+                if not id_match:
+                    continue
+                item_id = id_match.group(1)
+                clean_link = f"https://www.ebay.de/itm/{item_id}"
 
-                # Zusätzliche Absicherung bei Auktionen: Falls eBay doch ein Element mit "Tage" / "d" einstreut, herausfiltern
-                if mode["type"].startswith("AUKTION") and time_elem:
+                time_elem = _first(item, [".s-item__time-left", ".s-card__time-left", "[class*='time-left']"])
+                if time_elem:
+                    time_left = time_elem.get_text(" ", strip=True)
+                else:
+                    m = re.search(r"(?:noch|endet in)\s[^·|\n]{1,30}", item.get_text(" ", strip=True), flags=re.IGNORECASE)
+                    time_left = m.group(0) if m else ""
+
+                if mode["type"].startswith("AUKTION"):
                     t_low = time_left.lower()
                     if "tag" in t_low or re.search(r"\b\d+\s*t\b", t_low):
                         continue
+                display_time = time_left or ("Sofort verfügbar" if mode["type"] == "SOFORT-KAUFEN" else "unbekannt")
 
-                clean_link = link_elem["href"].split("?")[0]
-                item_id = clean_link.split("/")[-1]
-                offer_id = f"ebay_{mode['type'][:3]}_{item_id}"
-
-                if offer_id not in seen:
-                    msg = (
-                        f"{mode['emoji']} <b>EBAY {mode['type']}</b>\n"
-                        f"Titel: {title}\n"
-                        f"Aktueller Preis: <b>{price:.2f} €</b>\n"
-                        f"Restlaufzeit: <b>{time_left}</b>\n"
-                        f"👉 <a href='{clean_link}'>Zum eBay-Angebot</a>"
-                    )
-                    send_telegram(msg)
-                    seen.add(offer_id)
+                msg = (
+                    f"{mode['emoji']} <b>EBAY {mode['type']}</b>\n"
+                    f"Titel: {esc(title)}\n"
+                    f"Aktueller Preis: <b>{price:.2f} €</b>\n"
+                    f"Restlaufzeit: <b>{esc(display_time)}</b>\n"
+                    f"👉 <a href='{esc(clean_link)}'>Zum eBay-Angebot</a>"
+                )
+                alert_once(state, f"ebay_{mode['type'][:3]}_{item_id}", msg)
         except Exception as e:
-            print(f"eBay-Check Fehler ({mode['type']}): {e}")
+            errors.append(f"{mode['type']}: {e}")
+
+    record_health(state, "eBay", not errors, "; ".join(errors))
+
 
 if __name__ == "__main__":
-    seen_offers = load_seen()
-    check_apple_store_pickup(seen_offers)
-    check_geizhals_shops(seen_offers)
-    check_kleinanzeigen(seen_offers)
-    check_ebay(seen_offers)
-    save_seen(seen_offers)
+    state = load_state()
+    try:
+        for check in (check_apple_store_pickup, check_geizhals_shops, check_kleinanzeigen, check_ebay):
+            try:
+                check(state)
+            except Exception as e:
+                record_health(state, check.__name__, False, repr(e))
+    finally:
+        save_state(state)
