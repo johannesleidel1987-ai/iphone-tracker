@@ -1,8 +1,6 @@
 name: iPhone Duo 256GB Tracker
 
 on:
-  schedule:
-    - cron: '*/20 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -13,13 +11,6 @@ jobs:
     steps:
       - name: Code auschecken
         uses: actions/checkout@v4
-
-      - name: Test-Push bei manuellem Start senden
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -d text="✅ Verbindung steht! Dein iPhone Duo Tracker (256 GB Sternenweiß ≤ 2.400 €) läuft jetzt auf GitHub und prüft alle 20 Minuten automatisch die Bestände."
 
       - name: Python einrichten
         uses: actions/setup-python@v5
