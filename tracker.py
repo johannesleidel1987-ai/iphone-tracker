@@ -520,7 +520,7 @@ def check_ebay(state):
                 display_time = time_left or ("Sofort verfügbar" if mode["type"] == "SOFORT-KAUFEN" else "unbekannt")
 
                 msg = (
-                    f"{mode['emoji']} <b>EBAY {mode['type']}</b>\n"
+                    f"{mode['emoji']} <b>EBAY {esc(mode['type'])}</b>\n"
                     f"Titel: {esc(title)}\n"
                     f"Aktueller Preis: <b>{price:.2f} €</b>\n"
                     f"Restlaufzeit: <b>{esc(display_time)}</b>\n"
@@ -536,8 +536,8 @@ def check_ebay(state):
 if __name__ == "__main__":
     state = load_state()
     try:
-        for check in (check_apple_store_pickup, send_daily_restock_digest,
-                      check_geizhals_shops, check_kleinanzeigen, check_ebay):
+        # Apple-Check läuft lokal (local/apple_check.py): Apple blockt GitHub-IPs mit HTTP 541
+        for check in (check_geizhals_shops, check_kleinanzeigen, check_ebay):
             try:
                 check(state)
             except Exception as e:
