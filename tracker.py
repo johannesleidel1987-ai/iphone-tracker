@@ -516,7 +516,8 @@ def check_billiger(state):
             seller = m.group(1).strip()
         else:
             logo = row.select_one("img[alt]")
-            seller = logo["alt"].strip() if logo and logo["alt"].strip() else f"Shop {row.get('data-shop-id', '?')}"
+            alt = re.sub(r"^Shop\s+", "", logo["alt"].strip()) if logo else ""
+            seller = alt or f"Shop {row.get('data-shop-id', '?')}"
         prices = [parse_price(p) for p in re.findall(r"(\d{1,3}(?:\.\d{3})*,\d{2})\s*€", text)]
         price = next((p for p in prices if p and p >= 100), None)  # Versandkosten überspringen
         dm = re.search(r"Lieferzeit:\s*\|?\s*([^|]+)", text)
