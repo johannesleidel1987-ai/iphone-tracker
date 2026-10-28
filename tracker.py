@@ -383,6 +383,73 @@ def check_geizhals_shops(state):
             del active[shop]
 
 
+# ---------------- billiger.de ----------------
+
+BILLIGER_URL = "https://www.billiger.de/products/5941011354-apple-iphone-duo-256-gb-sternenweiss"
+
+
+def check_billiger(state):
+    """Prüft billiger.de über die JSON-LD-Angebotsliste. Alarm bei neuem Shop oder Preissenkung im Preisrahmen.
+    Die Daten enthalten keine Lieferzeit – die Meldung weist darauf hin."""
+    try:
+        r = fetch(BILLIGER_URL)
+    except Exception as e:
+        record_health(state, "billiger.de", False, str(e))
+        return
+    if r.status_code != 200:
+        record_health(state, "billiger.de", False, f"HTTP {r.status_code}")
+        return
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    offers = None
+    for s in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(s.get_text())
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("@type") == "Product" and isinstance(data.get("offers"), dict):
+            offers = data["offers"].get("offers", [])
+            break
+    if offers is None:
+        record_health(state, "billiger.de", False, "Keine Angebotsdaten (JSON-LD) gefunden")
+        return
+    record_health(state, "billiger.de", True)
+
+    current = {}
+    for o in offers:
+        seller = (o.get("seller") or {}).get("name", "").strip()
+        try:
+            price = float(o.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if not seller or "NewCondition" not in o.get("itemCondition", "NewCondition"):
+            continue
+        if MIN_PRICE <= price <= MAX_PRICE and (seller not in current or price < current[seller]):
+            current[seller] = price
+    print(f"  billiger.de: {len(offers)} Angebote, {len(current)} im Preisrahmen")
+
+    active = state["active"].setdefault("billiger", {})
+    for seller, price in current.items():
+        prev = active.get(seller)
+        if prev is not None and price >= prev:
+            active[seller] = price
+            continue
+        headline = "PREIS GESUNKEN" if prev is not None else "NEUES ANGEBOT"
+        msg = (
+            f"💶 <b>BILLIGER.DE – {headline}: {esc(seller)}</b>\n"
+            f"Modell: iPhone Duo 256 GB Sternenweiß\n"
+            f"Preis: <b>{price:.2f} €</b>\n"
+            f"<i>Lieferzeit nicht in den Daten – auf der Seite prüfen.</i>\n"
+            f"👉 <a href='{BILLIGER_URL}'>Zu billiger.de</a>"
+        )
+        if send_telegram(msg):
+            active[seller] = price
+
+    for seller in list(active):
+        if seller not in current:
+            del active[seller]
+
+
 # ---------------- Kleinanzeigen ----------------
 
 def check_kleinanzeigen(state):
@@ -551,7 +618,7 @@ if __name__ == "__main__":
         # Apple-Check über GitHub Actions (Alternative: local/apple_check.py – nie beide parallel betreiben)
         # eBay läuft lokal (local/ebay_check.py): eBay blockt GitHub-IPs mit HTTP 403
         for check in (check_apple_store_pickup, send_daily_restock_digest,
-                      check_geizhals_shops, check_kleinanzeigen):
+                      check_geizhals_shops, check_billiger, check_kleinanzeigen):
             try:
                 check(state)
             except Exception as e:
