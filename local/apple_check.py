@@ -90,7 +90,7 @@ def query_stores():
     observed, errors, cities = {}, [], set()
     for plz in SEARCH_PLZ:
         qs = urllib.parse.urlencode({"pl": "true", "mts.0": "regular", "parts.0": MPN, "location": plz})
-        url = f"https://www.apple.com/de/shop/fulfillment-messages?{qs}"
+        url = f"https://www.apple.com/de/shop/retail/pickup-message?{qs}"
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=HEADERS), timeout=15) as r:
                 body = json.load(r)
@@ -100,7 +100,8 @@ def query_stores():
         except Exception as e:
             errors.append(f"PLZ {plz}: {e}")
             continue
-        stores = body.get("body", {}).get("content", {}).get("pickupMessage", {}).get("stores", [])
+        b = body.get("body", {})
+        stores = b.get("stores") or b.get("content", {}).get("pickupMessage", {}).get("stores", [])
         if not stores:
             errors.append(f"PLZ {plz}: keine Stores in der Antwort")
             continue

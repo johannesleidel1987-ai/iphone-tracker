@@ -1,6 +1,6 @@
 # Apple-Check lokal (Windows)
 
-Apple blockt GitHub-Actions-IPs (HTTP 541). Deshalb läuft die Apple-Store-Abfrage auf einem Windows-Rechner im Heimnetz.
+Apple-Store-Abfrage über `/shop/retail/pickup-message` (der alte Endpunkt `/shop/fulfillment-messages` liefert seit 2026 nur noch HTTP 541). Läuft auf einem Windows-Rechner im Heimnetz.
 
 Prüft alle 5 Minuten iPhone Duo 256 GB Sternenweiß (MK2D4ZD/A) in München (Rosenstraße, OEZ), Augsburg und Sindelfingen.
 Sofort-Alarm bei Bestand, Tagesmeldung mit Restock-Zeiten ab 21:00, Warnung nach 6 Fehlläufen in Folge.

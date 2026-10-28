@@ -180,13 +180,14 @@ def check_apple_store_pickup(state):
     seen_cities = set()
 
     for plz in APPLE_SEARCH_LOCATIONS:
-        url = f"https://www.apple.com/de/shop/fulfillment-messages?pl=true&mts.0=regular&{parts_query}&location={plz}"
+        url = f"https://www.apple.com/de/shop/retail/pickup-message?pl=true&mts.0=regular&{parts_query}&location={plz}"
         try:
             r = fetch(url, timeout=12)
             if r.status_code != 200:
                 errors.append(f"PLZ {plz}: HTTP {r.status_code}")
                 continue
-            stores = r.json().get("body", {}).get("content", {}).get("pickupMessage", {}).get("stores", [])
+            b = r.json().get("body", {})
+            stores = b.get("stores") or b.get("content", {}).get("pickupMessage", {}).get("stores", [])
             if not stores:
                 errors.append(f"PLZ {plz}: keine Stores in der Antwort")
                 continue
@@ -536,7 +537,7 @@ def check_ebay(state):
 if __name__ == "__main__":
     state = load_state()
     try:
-        # Apple-Check läuft lokal (local/apple_check.py): Apple blockt GitHub-IPs mit HTTP 541
+        # Apple-Check läuft lokal (local/apple_check.py) – check_apple_store_pickup hier nur als Reserve
         for check in (check_geizhals_shops, check_kleinanzeigen, check_ebay):
             try:
                 check(state)
