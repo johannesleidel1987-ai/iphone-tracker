@@ -30,7 +30,10 @@ ALLOWED_APPLE_STORES = ["augsburg", "city-galerie", "rosenstraße", "rosenstrass
 EXPECTED_APPLE_CITIES = ["münchen", "augsburg", "sindelfingen"]
 
 # Tägliche Restock-Zusammenfassung (Ortszeit Berlin)
-TZ = ZoneInfo("Europe/Berlin")
+try:
+    TZ = ZoneInfo("Europe/Berlin")
+except Exception:  # Windows ohne tzdata-Paket: Ortszeit des Rechners verwenden
+    TZ = None
 DIGEST_HOUR = 21                        # erster Lauf ab 21:00 sendet die Tagesmeldung
 RESTOCK_LOG_RETENTION_DAYS = 14
 
