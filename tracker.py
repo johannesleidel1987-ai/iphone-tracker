@@ -471,9 +471,17 @@ def check_ebay(state):
     ]
 
     errors = []
+    # eBay lehnt die erste Anfrage ohne Cookies oft mit 403 ab: Startseite zuerst laden, bei 403 einmal wiederholen
+    try:
+        fetch("https://www.ebay.de/")
+    except Exception as e:
+        print(f"eBay-Startseite: {e}")
     for mode in search_modes:
         try:
             r = fetch(mode["url"])
+            if r.status_code == 403:
+                time.sleep(3)
+                r = fetch(mode["url"])
             if r.status_code != 200:
                 errors.append(f"{mode['type']}: HTTP {r.status_code}")
                 continue
