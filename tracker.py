@@ -3,6 +3,8 @@ import json
 import os
 import re
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -15,13 +17,22 @@ MAX_PRICE = 2400.00
 MIN_PRICE = 1850.00         # Schutz vor Hüllen, Dummys und Fake-Inseraten bei Sofort-Kaufen
 MIN_PRICE_AUCTION = 500.00  # Niedrigerer Startfilter für laufende Auktionen (< 24h)
 
-# Unterstützte Herstellernummern für iPhone Duo 256GB Sternenweiß
-MPNS = ["MK2D4ZD/A", "MK2D4QL/A", "MK2D4SX/A"]
+# Apple-Store-Abfrage: nur die deutsche Teilenummer für iPhone Duo 256GB Sternenweiß.
+# Ausländische Suffixe (QL/A, SX/A) kennt apple.com/de nicht und können die ganze Antwort leeren.
+MPNS = ["MK2D4ZD/A"]
 
-# Postleitzahlen für Apple-API (deckt Augsburg, beide Münchner Stores und Stuttgart ab)
-APPLE_SEARCH_LOCATIONS = ["86150", "70173"]
-# Abgleich nur gegen den Store-Namen (nicht die Stadt). Gefundene Stores inkl. Store-Nummer stehen im Log.
-ALLOWED_APPLE_STORES = ["augsburg", "city-galerie", "rosenstraße", "rosenstrasse", "oez", "olympia", "stuttgart"]
+# Postleitzahlen für Apple-API: München (Rosenstraße, OEZ), Augsburg, Sindelfingen
+APPLE_SEARCH_LOCATIONS = ["80331", "86150", "71065"]
+# Abgleich gegen Store-Name und Stadt. Gefundene Stores inkl. Store-Nummer stehen im Log.
+ALLOWED_APPLE_STORES = ["augsburg", "city-galerie", "rosenstraße", "rosenstrasse", "oez", "olympia",
+                        "sindelfingen", "breuningerland", "münchen", "muenchen", "munich"]
+# Diese Städte müssen in der Antwort auftauchen, sonst Health-Fehler (erkennt geänderte Store-Namen)
+EXPECTED_APPLE_CITIES = ["münchen", "augsburg", "sindelfingen"]
+
+# Tägliche Restock-Zusammenfassung (Ortszeit Berlin)
+TZ = ZoneInfo("Europe/Berlin")
+DIGEST_HOUR = 21                        # erster Lauf ab 21:00 sendet die Tagesmeldung
+RESTOCK_LOG_RETENTION_DAYS = 14
 
 # Kleinanzeigen: breite Suche, Farbe wird nicht im Suchbegriff erzwungen (Blacklist filtert Fremdfarben)
 KA_QUERY = "iphone-duo-256"
@@ -33,7 +44,7 @@ STATE_FILE = "state.json"
 LEGACY_SEEN_FILE = "seen_offers.json"   # wird beim ersten Lauf einmalig übernommen
 SEEN_RETENTION_DAYS = 30
 
-HEALTH_FAIL_THRESHOLD = 4               # Fehlläufe in Folge bis zur Warnung (= 1 h bei 15-Min-Takt)
+HEALTH_FAIL_THRESHOLD = 6               # Fehlläufe in Folge bis zur Warnung (= 30 Min bei 5-Min-Takt)
 HEALTH_WARN_INTERVAL = 24 * 3600        # max. eine Warnung pro Quelle und Tag
 
 HEADERS = {
@@ -70,6 +81,9 @@ def load_state():
     state.setdefault("seen", {})     # offer_id -> Zeitstempel (Kleinanzeigen, eBay)
     state.setdefault("active", {})   # Kanal -> aktuell verfügbare Treffer (Apple, Geizhals)
     state.setdefault("health", {})   # Quelle -> Fehlerzähler
+    state.setdefault("apple_status", {})  # Store|MPN -> zuletzt beobachtet verfügbar (bool)
+    state.setdefault("restock_log", [])   # [{ts, store, city, mpn, event: "in"/"out"}]
+    state.setdefault("last_digest", "")   # Datum (YYYY-MM-DD) der letzten Tagesmeldung
     return state
 
 
@@ -163,6 +177,7 @@ def check_apple_store_pickup(state):
     parts_query = "&".join([f"parts.{i}={requests.utils.quote(mpn)}" for i, mpn in enumerate(MPNS)])
     observed = {}
     errors = []
+    seen_cities = set()
 
     for plz in APPLE_SEARCH_LOCATIONS:
         url = f"https://www.apple.com/de/shop/fulfillment-messages?pl=true&mts.0=regular&{parts_query}&location={plz}"
@@ -182,13 +197,17 @@ def check_apple_store_pickup(state):
                 store_number = store.get("storeNumber", "")
                 print(f"  Apple-Store: {store_name} ({city}) [{store_number}]")
 
-                if not any(allowed in store_name.lower() for allowed in ALLOWED_APPLE_STORES):
+                haystack = f"{store_name} {city}".lower()
+                if not any(allowed in haystack for allowed in ALLOWED_APPLE_STORES):
                     continue
+                seen_cities.add(city.lower())
 
                 parts_avail = store.get("partsAvailability", {})
                 for mpn in MPNS:
                     part_info = parts_avail.get(mpn, {})
                     key = f"{store_number or store_name}|{mpn}"
+                    if key in observed:
+                        continue  # Store bereits über andere PLZ erfasst
                     observed[key] = {
                         "available": part_info.get("pickupDisplay") == "available",
                         "store": store_name,
@@ -199,7 +218,12 @@ def check_apple_store_pickup(state):
         except Exception as e:
             errors.append(f"PLZ {plz}: {e}")
 
+    missing = [c for c in EXPECTED_APPLE_CITIES if not any(c in s for s in seen_cities)]
+    if missing and not errors:
+        errors.append(f"Erwartete Stores fehlen: {', '.join(missing)}")
     record_health(state, "Apple", not errors, "; ".join(errors))
+
+    log_restock_events(state, observed)
 
     # Nur beobachtete Stores aktualisieren – ein Fehlschlag löscht keinen bestehenden Status
     active = state["active"].setdefault("apple", {})
@@ -218,6 +242,75 @@ def check_apple_store_pickup(state):
         )
         if send_telegram(msg):
             active[key] = True
+
+
+def log_restock_events(state, observed):
+    """Protokolliert Wechsel verfügbar/nicht verfügbar je Store für die Tagesmeldung."""
+    status = state["apple_status"]
+    log = state["restock_log"]
+    now = time.time()
+    for key, info in observed.items():
+        was = status.get(key, False)
+        if info["available"] != was:
+            log.append({
+                "ts": now, "key": key, "store": info["store"], "city": info["city"],
+                "mpn": info["mpn"], "event": "in" if info["available"] else "out",
+            })
+        status[key] = info["available"]
+    cutoff = now - RESTOCK_LOG_RETENTION_DAYS * 86400
+    state["restock_log"] = [e for e in log if e["ts"] >= cutoff]
+
+
+def _hm(ts):
+    return datetime.fromtimestamp(ts, TZ).strftime("%H:%M")
+
+
+def send_daily_restock_digest(state):
+    """Einmal täglich ab DIGEST_HOUR: alle Apple-Restocks des Tages je Store mit Uhrzeit."""
+    now_local = datetime.now(TZ)
+    today = now_local.date().isoformat()
+    if now_local.hour < DIGEST_HOUR or state["last_digest"] == today:
+        return
+
+    day_start = datetime(now_local.year, now_local.month, now_local.day, tzinfo=TZ).timestamp()
+    by_store = {}
+    for e in sorted(state["restock_log"], key=lambda e: e["ts"]):
+        if e["ts"] < day_start:
+            continue
+        label = f"Apple {e['store']} ({e['city']})"
+        windows = by_store.setdefault(label, [])
+        if e["event"] == "in":
+            windows.append([e["ts"], None])
+        elif windows and windows[-1][1] is None:
+            windows[-1][1] = e["ts"]
+        else:
+            windows.append([None, e["ts"]])  # war schon vor Mitternacht verfügbar
+
+    # Stores, die den ganzen Tag ohne Wechsel verfügbar waren
+    for e in reversed(state["restock_log"]):
+        label = f"Apple {e['store']} ({e['city']})"
+        if state["apple_status"].get(e["key"]) and e["event"] == "in" and label not in by_store:
+            by_store[label] = [[None, None]]
+
+    lines =[f"📊 <b>Apple Restocks heute ({now_local.strftime('%d.%m.%Y')})</b>",
+             "iPhone Duo 256 GB Sternenweiß"]
+    if not by_store:
+        lines.append("Heute kein Bestand in München, Augsburg oder Sindelfingen.")
+    for label, windows in by_store.items():
+        lines.append(f"\n<b>{esc(label)}</b>")
+        for start, end in windows:
+            if start and end:
+                lines.append(f"• {_hm(start)}–{_hm(end)} Uhr ({round((end - start) / 60)} Min)")
+            elif start:
+                lines.append(f"• ab {_hm(start)} Uhr, noch verfügbar")
+            elif not end:
+                lines.append("• ganztägig verfügbar")
+            else:
+                lines.append(f"• seit Vortag verfügbar, bis {_hm(end)} Uhr")
+    lines.append("\n<i>Zeiten auf ±5 Min genau (Prüftakt).</i>")
+
+    if send_telegram("\n".join(lines)):
+        state["last_digest"] = today
 
 
 # ---------------- Geizhals ----------------
@@ -443,7 +536,8 @@ def check_ebay(state):
 if __name__ == "__main__":
     state = load_state()
     try:
-        for check in (check_apple_store_pickup, check_geizhals_shops, check_kleinanzeigen, check_ebay):
+        for check in (check_apple_store_pickup, send_daily_restock_digest,
+                      check_geizhals_shops, check_kleinanzeigen, check_ebay):
             try:
                 check(state)
             except Exception as e:
