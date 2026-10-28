@@ -537,8 +537,9 @@ def check_ebay(state):
 if __name__ == "__main__":
     state = load_state()
     try:
-        # Apple-Check läuft lokal (local/apple_check.py) – check_apple_store_pickup hier nur als Reserve
-        for check in (check_geizhals_shops, check_kleinanzeigen, check_ebay):
+        # Apple-Check über GitHub Actions (Alternative: local/apple_check.py – nie beide parallel betreiben)
+        for check in (check_apple_store_pickup, send_daily_restock_digest,
+                      check_geizhals_shops, check_kleinanzeigen, check_ebay):
             try:
                 check(state)
             except Exception as e:
