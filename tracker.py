@@ -388,9 +388,21 @@ def check_geizhals_shops(state):
 BILLIGER_URL = "https://www.billiger.de/products/5941011354-apple-iphone-duo-256-gb-sternenweiss"
 
 
+def billiger_in_stock(delivery):
+    """True nur bei eindeutig kurzfristiger Lieferbarkeit (sofort, Lager oder max. 5 Werktage)."""
+    d = delivery.lower()
+    if not d or any(b in d for b in ["woche", "monat", "unbestimmt", "vorbestell", "nicht lieferbar",
+                                     "ausverkauft", "anfang", "mitte", "ende", "2027"]):
+        return False
+    if any(k in d for k in ["sofort", "auf lager", "lagernd", "vorrätig"]):
+        return True
+    m = re.search(r"(\d+)\s*(?:-\s*(\d+))?\s*werktag", d)
+    return bool(m) and int(m.group(2) or m.group(1)) <= 5
+
+
 def check_billiger(state):
-    """Prüft billiger.de über die JSON-LD-Angebotsliste. Alarm bei neuem Shop oder Preissenkung im Preisrahmen.
-    Die Daten enthalten keine Lieferzeit – die Meldung weist darauf hin."""
+    """Prüft die Angebotszeilen auf billiger.de. Alarm nur bei Preis im Rahmen UND kurzfristiger Lieferzeit
+    (neuer Shop oder Preissenkung)."""
     try:
         r = fetch(BILLIGER_URL)
     except Exception as e:
@@ -401,49 +413,48 @@ def check_billiger(state):
         return
 
     soup = BeautifulSoup(r.text, "html.parser")
-    offers = None
-    for s in soup.select('script[type="application/ld+json"]'):
-        try:
-            data = json.loads(s.get_text())
-        except ValueError:
-            continue
-        if isinstance(data, dict) and data.get("@type") == "Product" and isinstance(data.get("offers"), dict):
-            offers = data["offers"].get("offers", [])
-            break
-    if offers is None:
-        record_health(state, "billiger.de", False, "Keine Angebotsdaten (JSON-LD) gefunden")
+    rows = soup.select("[data-offer-row]")
+    if not rows:
+        record_health(state, "billiger.de", False, "Keine Angebotszeilen (data-offer-row) gefunden")
         return
     record_health(state, "billiger.de", True)
 
     current = {}
-    for o in offers:
-        seller = (o.get("seller") or {}).get("name", "").strip()
-        try:
-            price = float(o.get("price"))
-        except (TypeError, ValueError):
-            continue
-        if not seller or "NewCondition" not in o.get("itemCondition", "NewCondition"):
-            continue
-        if MIN_PRICE <= price <= MAX_PRICE and (seller not in current or price < current[seller]):
-            current[seller] = price
-    print(f"  billiger.de: {len(offers)} Angebote, {len(current)} im Preisrahmen")
+    for row in rows:
+        text = row.get_text(" | ", strip=True)
+        m = re.search(r"Verkäufer:\s*\|?\s*([^|]+)", text) or re.search(r"€ bei ([^|]+)", text)
+        if m:
+            seller = m.group(1).strip()
+        else:
+            logo = row.select_one("img[alt]")
+            seller = logo["alt"].strip() if logo and logo["alt"].strip() else f"Shop {row.get('data-shop-id', '?')}"
+        prices = [parse_price(p) for p in re.findall(r"(\d{1,3}(?:\.\d{3})*,\d{2})\s*€", text)]
+        price = next((p for p in prices if p and p >= 100), None)  # Versandkosten überspringen
+        dm = re.search(r"Lieferzeit:\s*\|?\s*([^|]+)", text)
+        delivery = dm.group(1).strip() if dm else ""
+        stock = billiger_in_stock(delivery)
+        print(f"  billiger.de: {seller} | {price} € | {delivery or 'keine Lieferzeit'} | "
+              f"{'lieferbar' if stock else 'nicht lieferbar'}")
+        if price and MIN_PRICE <= price <= MAX_PRICE and stock:
+            if seller not in current or price < current[seller]["price"]:
+                current[seller] = {"price": price, "delivery": delivery}
 
     active = state["active"].setdefault("billiger", {})
-    for seller, price in current.items():
+    for seller, info in current.items():
         prev = active.get(seller)
-        if prev is not None and price >= prev:
-            active[seller] = price
+        if prev is not None and info["price"] >= prev:
+            active[seller] = info["price"]
             continue
-        headline = "PREIS GESUNKEN" if prev is not None else "NEUES ANGEBOT"
+        headline = "PREIS GESUNKEN" if prev is not None else "LIEFERBAR"
         msg = (
             f"💶 <b>BILLIGER.DE – {headline}: {esc(seller)}</b>\n"
             f"Modell: iPhone Duo 256 GB Sternenweiß\n"
-            f"Preis: <b>{price:.2f} €</b>\n"
-            f"<i>Lieferzeit nicht in den Daten – auf der Seite prüfen.</i>\n"
+            f"Preis: <b>{info['price']:.2f} €</b>\n"
+            f"Lieferzeit: <b>{esc(info['delivery'])}</b>\n"
             f"👉 <a href='{BILLIGER_URL}'>Zu billiger.de</a>"
         )
         if send_telegram(msg):
-            active[seller] = price
+            active[seller] = info["price"]
 
     for seller in list(active):
         if seller not in current:
