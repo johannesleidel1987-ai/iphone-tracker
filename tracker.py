@@ -538,8 +538,9 @@ if __name__ == "__main__":
     state = load_state()
     try:
         # Apple-Check über GitHub Actions (Alternative: local/apple_check.py – nie beide parallel betreiben)
+        # eBay läuft lokal (local/ebay_check.py): eBay blockt GitHub-IPs mit HTTP 403
         for check in (check_apple_store_pickup, send_daily_restock_digest,
-                      check_geizhals_shops, check_kleinanzeigen, check_ebay):
+                      check_geizhals_shops, check_kleinanzeigen):
             try:
                 check(state)
             except Exception as e:

@@ -1,19 +1,21 @@
-# Apple-Check lokal (Windows)
+# Lokale Checks (Windows)
 
-Apple-Store-Abfrage über `/shop/retail/pickup-message` (der alte Endpunkt `/shop/fulfillment-messages` liefert seit 2026 nur noch HTTP 541). Läuft auf einem Windows-Rechner im Heimnetz.
+## eBay-Check (aktiv)
 
-Prüft alle 5 Minuten iPhone Duo 256 GB Sternenweiß (MK2D4ZD/A) in München (Rosenstraße, OEZ), Augsburg und Sindelfingen.
-Sofort-Alarm bei Bestand, Tagesmeldung mit Restock-Zeiten ab 21:00, Warnung nach 6 Fehlläufen in Folge.
+eBay blockt GitHub-Actions-IPs (HTTP 403). Deshalb läuft die eBay-Suche (Sofort-Kaufen und Auktionen < 24 h) auf einem Windows-Rechner im Heimnetz. `ebay_check.py` nutzt `check_ebay()` aus `../tracker.py` – Filter und Telegram-Meldungen sind identisch.
 
-## Einrichtung
+### Einrichtung
 
-1. Ordner `local` auf den Rechner kopieren, z. B. nach `C:\Users\<Name>\iphone-check`.
-2. `config.example.json` als `config.json` kopieren und Bot-Token sowie Chat-ID eintragen.
-3. Test: `py apple_check.py --test` – zeigt die vier Stores und sendet eine Telegram-Testnachricht.
-4. Aufgabe anlegen: `powershell -ExecutionPolicy Bypass -File install_task.ps1`
+1. Repo-ZIP entpacken, sodass `tracker.py` direkt über dem Ordner `local` liegt.
+2. `config.example.json` als `config.json` kopieren, Bot-Token und Chat-ID eintragen.
+3. Bibliotheken: `py -m pip install requests beautifulsoup4`
+4. Test: `py ebay_check.py` – Ausgabe zeigt HTTP-Status und Anzahl der eBay-Einträge.
+5. Aufgabe anlegen: `powershell -ExecutionPolicy Bypass -File install_task.ps1`
 
 Rechner darf gesperrt sein, aber nicht in den Ruhezustand gehen.
 
-## Entfernen
+Entfernen: `Unregister-ScheduledTask -TaskName "iPhone Duo eBay-Check" -Confirm:$false`
 
-`Unregister-ScheduledTask -TaskName "iPhone Duo Apple-Check" -Confirm:$false`
+## Apple-Check (Reserve)
+
+Der Apple-Check läuft über GitHub Actions (`/shop/retail/pickup-message`). `apple_check.py` ist nur Reserve, falls Apple GitHub-IPs künftig blockt – dann in `tracker.py` deaktivieren und lokal einplanen. Nie beide parallel betreiben (doppelte Alarme).

@@ -1,10 +1,10 @@
-# Legt die Windows-Aufgabe "iPhone Duo Apple-Check" an: alle 5 Minuten, nur aktueller Benutzer, ohne Admin.
+# Legt die Windows-Aufgabe "iPhone Duo eBay-Check" an: alle 5 Minuten, nur aktueller Benutzer, ohne Admin.
 # Aufruf im Ordner local:  powershell -ExecutionPolicy Bypass -File install_task.ps1
-# Entfernen:               Unregister-ScheduledTask -TaskName "iPhone Duo Apple-Check" -Confirm:$false
+# Entfernen:               Unregister-ScheduledTask -TaskName "iPhone Duo eBay-Check" -Confirm:$false
 
 $ErrorActionPreference = "Stop"
-$TaskName = "iPhone Duo Apple-Check"
-$Script = Join-Path $PSScriptRoot "apple_check.py"
+$TaskName = "iPhone Duo eBay-Check"
+$Script = Join-Path $PSScriptRoot "ebay_check.py"
 
 # pythonw.exe startet ohne Konsolenfenster
 $pyw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
@@ -13,6 +13,9 @@ if (-not $pyw) {
     if ($py) { $pyw = Join-Path (Split-Path $py) "pythonw.exe" }
 }
 if (-not $pyw -or -not (Test-Path $pyw)) { throw "pythonw.exe nicht gefunden. Python-Installation pruefen." }
+$libsOk = $true
+try { & $pyw -c "import requests, bs4" 2>$null; if ($LASTEXITCODE -ne 0) { $libsOk = $false } } catch { $libsOk = $false }
+if (-not $libsOk) { throw "requests/beautifulsoup4 fehlen: py -m pip install requests beautifulsoup4" }
 if (-not (Test-Path (Join-Path $PSScriptRoot "config.json"))) { throw "config.json fehlt (Vorlage: config.example.json)." }
 
 $action   = New-ScheduledTaskAction -Execute $pyw -Argument "`"$Script`"" -WorkingDirectory $PSScriptRoot
@@ -23,7 +26,7 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
               -ExecutionTimeLimit (New-TimeSpan -Minutes 3)
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
-    -Description "Apple-Store-Bestand iPhone Duo 256 GB Sternenweiss (Muenchen, Augsburg, Sindelfingen)" -Force | Out-Null
+    -Description "eBay-Angebote iPhone Duo 256 GB Sternenweiss (Sofort-Kaufen und Auktionen < 24h)" -Force | Out-Null
 
 Write-Host "Aufgabe '$TaskName' angelegt: alle 5 Minuten mit $pyw"
-Write-Host "Log: $(Join-Path $PSScriptRoot 'apple_check.log')"
+Write-Host "State: $(Join-Path $PSScriptRoot 'ebay_state.json')"

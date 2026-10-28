@@ -3,3 +3,4 @@ __pycache__/
 local/config.json
 local/apple_state.json
 local/apple_check.log
+local/ebay_state.json
