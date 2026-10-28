@@ -54,6 +54,35 @@ def probe(name, url):
         print(f"  Link: {line}")
 
 
+BILLIGER_PRODUCT = "https://www.billiger.de/products/5941011354-apple-iphone-duo-256-gb-sternenweiss"
+
+
+def probe_structure(url):
+    """Zeigt JSON-LD und häufige Klassen, um den Angebotsparser zu bauen."""
+    print(f"\n=== Struktur Produktseite ===\n{url}")
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+    except Exception as e:
+        print(f"FEHLER: {e!r}")
+        return
+    print(f"HTTP {r.status_code} | {len(r.text)} Zeichen")
+    soup = BeautifulSoup(r.text, "html.parser")
+    for i, s in enumerate(soup.select('script[type="application/ld+json"]')[:3]):
+        print(f"--- JSON-LD {i} ---\n{s.get_text()[:2500]}")
+    counts = {}
+    for el in soup.select("[class]"):
+        for c in el.get("class", []):
+            if any(k in c.lower() for k in ("offer", "shop", "price", "merchant", "delivery", "avail")):
+                counts[c] = counts.get(c, 0) + 1
+    for c, n in sorted(counts.items(), key=lambda x: -x[1])[:25]:
+        print(f"  Klasse {c}: {n}x")
+    first = soup.select_one("[class*='offer']")
+    if first:
+        print("--- erstes Element mit 'offer' (HTML gekürzt) ---")
+        print(str(first)[:2000])
+
+
 if __name__ == "__main__":
     for name, url in PROBES.items():
         probe(name, url)
+    probe_structure(BILLIGER_PRODUCT)
