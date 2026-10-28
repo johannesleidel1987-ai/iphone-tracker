@@ -292,7 +292,7 @@ def send_daily_restock_digest(state):
         if state["apple_status"].get(e["key"]) and e["event"] == "in" and label not in by_store:
             by_store[label] = [[None, None]]
 
-    lines =[f"📊 <b>Apple Restocks heute ({now_local.strftime('%d.%m.%Y')})</b>",
+    lines = [f"📊 <b>Apple Restocks heute ({now_local.strftime('%d.%m.%Y')})</b>",
              "iPhone Duo 256 GB Sternenweiß"]
     if not by_store:
         lines.append("Heute kein Bestand in München, Augsburg oder Sindelfingen.")
