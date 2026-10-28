@@ -35,6 +35,7 @@ try:
 except Exception:  # Windows ohne tzdata-Paket: Ortszeit des Rechners verwenden
     TZ = None
 DIGEST_HOUR = 21                        # erster Lauf ab 21:00 sendet die Tagesmeldung
+MORNING_TIME = (7, 30)                  # erster Lauf ab 07:30 sendet die Nachschub-Übersicht aller Stores
 RESTOCK_LOG_RETENTION_DAYS = 14
 
 # Kleinanzeigen: breite Suche, Farbe wird nicht im Suchbegriff erzwungen (Blacklist filtert Fremdfarben)
@@ -175,9 +176,32 @@ def title_ok(title):
 
 # ---------------- Apple ----------------
 
+TARGET_MPN = MPNS[0]
+APPLE_BUY_URL = "https://www.apple.com/de/shop/buy-iphone/iphone-duo"
+
+
+def apple_parts(state):
+    """Alle deutschen Teilenummern des iPhone Duo (Farben x Speicher), einmal täglich von der Kaufseite gelesen."""
+    cache = state.setdefault("apple_parts", {"date": "", "parts": []})
+    today = datetime.now(TZ).date().isoformat()
+    if cache["date"] != today or not cache["parts"]:
+        try:
+            r = fetch(APPLE_BUY_URL)
+            found = sorted(set(re.findall(r"\bM[A-Z0-9]{4}ZD/A\b", r.text))) if r.status_code == 200 else []
+            if found:
+                cache.update(date=today, parts=found[:15])
+                print(f"  Apple-Teilenummern: {', '.join(cache['parts'])}")
+        except Exception as e:
+            print(f"  Apple-Kaufseite: {e}")
+    parts = [p for p in cache["parts"] if p != TARGET_MPN]
+    return [TARGET_MPN] + parts
+
+
 def check_apple_store_pickup(state):
-    """Prüft die Apple Fulfillment API. Alarm nur beim Wechsel nicht verfügbar -> verfügbar."""
-    parts_query = "&".join([f"parts.{i}={requests.utils.quote(mpn)}" for i, mpn in enumerate(MPNS)])
+    """Prüft die Apple-Abholverfügbarkeit aller iPhone-Duo-Varianten.
+    Sofort-Alarm nur für TARGET_MPN; alle Varianten fließen ins Restock-Protokoll (Morgenmeldung)."""
+    parts = apple_parts(state)
+    parts_query = "&".join([f"parts.{i}={requests.utils.quote(mpn)}" for i, mpn in enumerate(parts)])
     observed = {}
     errors = []
     seen_cities = set()
@@ -205,18 +229,28 @@ def check_apple_store_pickup(state):
                 if not any(allowed in haystack for allowed in ALLOWED_APPLE_STORES):
                     continue
                 seen_cities.add(city.lower())
+                state.setdefault("apple_stores", {})[store_number or store_name] = {"store": store_name, "city": city}
 
                 parts_avail = store.get("partsAvailability", {})
-                for mpn in MPNS:
-                    part_info = parts_avail.get(mpn, {})
+                for mpn in parts:
+                    part_info = parts_avail.get(mpn)
+                    if part_info is None and mpn != TARGET_MPN:
+                        continue  # Teilenummer an diesem Store unbekannt
+                    part_info = part_info or {}
+                    title = (part_info.get("messageTypes", {}).get("regular", {})
+                             .get("storePickupProductTitle", "") or mpn)
+                    if mpn != TARGET_MPN and not re.search(r"iphone duo\b.*\d+\s*(gb|tb)", title.lower()):
+                        continue  # Zubehör o. Ä. von der Kaufseite
                     key = f"{store_number or store_name}|{mpn}"
                     if key in observed:
                         continue  # Store bereits über andere PLZ erfasst
                     observed[key] = {
                         "available": part_info.get("pickupDisplay") == "available",
                         "store": store_name,
+                        "store_id": store_number or store_name,
                         "city": city,
                         "mpn": mpn,
+                        "title": title.replace("iPhone Duo", "").strip() or mpn,
                         "quote": part_info.get("pickupSearchQuote", "Verfügbar"),
                     }
         except Exception as e:
@@ -232,6 +266,8 @@ def check_apple_store_pickup(state):
     # Nur beobachtete Stores aktualisieren – ein Fehlschlag löscht keinen bestehenden Status
     active = state["active"].setdefault("apple", {})
     for key, info in observed.items():
+        if info["mpn"] != TARGET_MPN:
+            continue
         if not info["available"]:
             active.pop(key, None)
             continue
@@ -254,11 +290,15 @@ def log_restock_events(state, observed):
     log = state["restock_log"]
     now = time.time()
     for key, info in observed.items():
+        if key not in status and info["mpn"] != TARGET_MPN:
+            status[key] = info["available"]  # neue Variante: erst Ausgangslage merken, kein Restock
+            continue
         was = status.get(key, False)
         if info["available"] != was:
             log.append({
-                "ts": now, "key": key, "store": info["store"], "city": info["city"],
-                "mpn": info["mpn"], "event": "in" if info["available"] else "out",
+                "ts": now, "key": key, "store": info["store"], "store_id": info["store_id"],
+                "city": info["city"], "mpn": info["mpn"], "title": info["title"],
+                "event": "in" if info["available"] else "out",
             })
         status[key] = info["available"]
     cutoff = now - RESTOCK_LOG_RETENTION_DAYS * 86400
@@ -277,8 +317,9 @@ def send_daily_restock_digest(state):
         return
 
     day_start = datetime(now_local.year, now_local.month, now_local.day, tzinfo=TZ).timestamp()
+    target_log = [e for e in state["restock_log"] if e.get("mpn", TARGET_MPN) == TARGET_MPN]
     by_store = {}
-    for e in sorted(state["restock_log"], key=lambda e: e["ts"]):
+    for e in sorted(target_log, key=lambda e: e["ts"]):
         if e["ts"] < day_start:
             continue
         label = f"Apple {e['store']} ({e['city']})"
@@ -291,7 +332,7 @@ def send_daily_restock_digest(state):
             windows.append([None, e["ts"]])  # war schon vor Mitternacht verfügbar
 
     # Stores, die den ganzen Tag ohne Wechsel verfügbar waren
-    for e in reversed(state["restock_log"]):
+    for e in reversed(target_log):
         label = f"Apple {e['store']} ({e['city']})"
         if state["apple_status"].get(e["key"]) and e["event"] == "in" and label not in by_store:
             by_store[label] = [[None, None]]
@@ -315,6 +356,54 @@ def send_daily_restock_digest(state):
 
     if send_telegram("\n".join(lines)):
         state["last_digest"] = today
+
+
+def _when(ts, now_local):
+    d = datetime.fromtimestamp(ts, TZ)
+    delta = (now_local.date() - d.date()).days
+    day = {0: "heute", 1: "gestern"}.get(delta, d.strftime("%a %d.%m.").replace(
+        "Mon", "Mo").replace("Tue", "Di").replace("Wed", "Mi").replace("Thu", "Do")
+        .replace("Fri", "Fr").replace("Sat", "Sa").replace("Sun", "So"))
+    return f"{day} {d.strftime('%H:%M')}"
+
+
+def send_morning_report(state):
+    """Einmal täglich ab MORNING_TIME: je Store letzter Nachschub (alle Varianten), übliche Uhrzeit, Anzahl diese Woche."""
+    now_local = datetime.now(TZ)
+    today = now_local.date().isoformat()
+    if (now_local.hour, now_local.minute) < MORNING_TIME or state.get("last_morning") == today:
+        return
+
+    week_start = datetime(now_local.year, now_local.month, now_local.day, tzinfo=TZ).timestamp() \
+        - now_local.weekday() * 86400
+    seven_days = time.time() - 7 * 86400
+    ins = [e for e in state["restock_log"] if e["event"] == "in" and e.get("store_id")]
+
+    lines = [f"🌅 <b>Apple-Nachschub – Stand {now_local.strftime('%d.%m. %H:%M')}</b>",
+             "iPhone Duo, alle Farben und Speichergrößen"]
+    stores = state.get("apple_stores", {})
+    if not stores:
+        lines.append("Noch keine Store-Daten.")
+    for sid, meta in sorted(stores.items(), key=lambda x: x[1]["city"]):
+        mine = [e for e in ins if e["store_id"] == sid]
+        lines.append(f"\n<b>{esc(meta['store'])} ({esc(meta['city'])})</b>")
+        if not mine:
+            lines.append("• noch kein Nachschub erfasst")
+            continue
+        last_ts = max(e["ts"] for e in mine)
+        last_items = sorted({e.get("title", e["mpn"]) for e in mine if e["ts"] == last_ts})
+        target_hit = any(e["mpn"] == TARGET_MPN for e in mine if e["ts"] == last_ts)
+        lines.append(f"• zuletzt aufgefüllt <b>{_when(last_ts, now_local)}</b>: {esc(', '.join(last_items))}"
+                     + (" ⭐" if target_hit else ""))
+        runs_week = {e["ts"] for e in mine if e["ts"] >= week_start}
+        hours = [datetime.fromtimestamp(t, TZ).hour for t in {e["ts"] for e in mine if e["ts"] >= seven_days}]
+        usual = f"meist gegen {max(set(hours), key=hours.count):02d}:00 · " if len(hours) >= 2 else ""
+        lines.append(f"• {usual}diese Woche {len(runs_week)}-mal aufgefüllt")
+    n_variants = len({k.split("|", 1)[1] for k in state["apple_status"]})
+    lines.append(f"\n⭐ = Sternenweiß 256 GB dabei · {n_variants} Varianten erfasst · <i>Zeiten ±5 Min.</i>")
+
+    if send_telegram("\n".join(lines)):
+        state["last_morning"] = today
 
 
 # ---------------- Geizhals ----------------
@@ -628,7 +717,7 @@ if __name__ == "__main__":
     try:
         # Apple-Check über GitHub Actions (Alternative: local/apple_check.py – nie beide parallel betreiben)
         # eBay läuft lokal (local/ebay_check.py): eBay blockt GitHub-IPs mit HTTP 403
-        for check in (check_apple_store_pickup, send_daily_restock_digest,
+        for check in (check_apple_store_pickup, send_morning_report, send_daily_restock_digest,
                       check_geizhals_shops, check_billiger, check_kleinanzeigen):
             try:
                 check(state)
