@@ -1,7 +1,7 @@
 """
 Apple-Store-Bestandsprüfung für iPhone Duo 256 GB Sternenweiß – lokal unter Windows.
 
-Läuft per Aufgabenplanung alle 5 Minuten vom Heimnetz aus (GitHub-/Azure-IPs blockt Apple mit HTTP 541).
+Läuft per Aufgabenplanung alle 2 Minuten vom Heimnetz aus (GitHub-/Azure-IPs blockt Apple mit HTTP 541).
 Nur Python-Standardbibliothek, keine pip-Installation nötig.
 
 Aufruf:
@@ -30,7 +30,7 @@ EXPECTED_CITIES = ["münchen", "augsburg", "sindelfingen"]
 
 DIGEST_HOUR = 21                 # Tagesmeldung beim ersten Lauf ab 21:00 Ortszeit
 LOG_RETENTION_DAYS = 14
-HEALTH_FAIL_THRESHOLD = 6        # 30 Min bei 5-Min-Takt
+HEALTH_FAIL_THRESHOLD = 15       # 30 Min bei 2-Min-Takt
 HEALTH_WARN_INTERVAL = 24 * 3600
 BUY_URL = "https://www.apple.com/de/shop/buy-iphone/iphone-duo"
 
@@ -211,7 +211,7 @@ def daily_digest(state):
     fails = state.get("health", {}).get("fails", 0)
     if fails:
         lines.append(f"\n⚠️ Aktuell {fails} Fehlläufe in Folge – siehe apple_check.log")
-    lines.append("\n<i>Zeiten auf ±5 Min genau (Prüftakt).</i>")
+    lines.append("\n<i>Zeiten auf ±2 Min genau (Prüftakt).</i>")
     if send_telegram("\n".join(lines)):
         state["last_digest"] = today
 
