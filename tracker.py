@@ -19,7 +19,6 @@ MIN_PRICE_AUCTION = 500.00  # Niedrigerer Startfilter für laufende Auktionen (<
 # Überwachte Varianten (alle Sternenweiß). Je Variante eigener Preisrahmen und eigene Quellen-URLs.
 # min_price schützt vor Hüllen, Dummys und Fake-Inseraten bei Sofort-Kaufen.
 # mpn: nur deutsche Teilenummern – ausländische Suffixe (QL/A, SX/A) kennt apple.com/de nicht.
-# billiger: None = Produktseite wird automatisch über BILLIGER_BASE_URL gesucht.
 VARIANTS = [
     {
         "storage": "256",
@@ -27,8 +26,6 @@ VARIANTS = [
         "mpn": "MK2D4ZD/A",
         "min_price": 1850.00,
         "max_price": 2400.00,   # UVP 2.299 €
-        "geizhals": "https://geizhals.de/apple-iphone-duo-256gb-sternenweiss-a3936870.html?t=v&vl=de&va=b",
-        "billiger": "https://www.billiger.de/products/5941011354-apple-iphone-duo-256-gb-sternenweiss",
     },
     {
         "storage": "512",
@@ -36,8 +33,6 @@ VARIANTS = [
         "mpn": "MK2F4ZD/A",
         "min_price": 2100.00,
         "max_price": 2650.00,   # UVP 2.549 €
-        "geizhals": "https://geizhals.de/apple-iphone-duo-512gb-sternenweiss-a3936871.html?t=v&vl=de&va=b",
-        "billiger": None,
     },
 ]
 
@@ -58,8 +53,7 @@ DIGEST_HOUR = 21                        # erster Lauf ab 21:00 sendet die Tagesm
 MORNING_TIME = (7, 30)                  # erster Lauf ab 07:30 sendet die Nachschub-Übersicht aller Stores
 RESTOCK_LOG_RETENTION_DAYS = 14
 
-# Kleinanzeigen: Suche "iphone-duo-<Speicher>", Farbe wird nicht erzwungen (Blacklist filtert Fremdfarben).
-# Titel muss "duo" und die Speichergröße der Variante enthalten (Kleinanzeigen + eBay).
+# eBay: Titel muss "duo" und die Speichergröße der Variante enthalten.
 
 STATE_FILE = "state.json"
 LEGACY_SEEN_FILE = "seen_offers.json"   # wird beim ersten Lauf einmalig übernommen
@@ -99,16 +93,12 @@ def load_state():
             legacy = json.load(f)
         now = time.time()
         state = {"seen": {offer_id: now for offer_id in legacy}}
-    state.setdefault("seen", {})     # offer_id -> Zeitstempel (Kleinanzeigen, eBay)
-    state.setdefault("active", {})   # Kanal -> aktuell verfügbare Treffer (Apple, Geizhals)
+    state.setdefault("seen", {})     # offer_id -> Zeitstempel (eBay)
+    state.setdefault("active", {})   # Kanal -> aktuell verfügbare Treffer (Apple)
     state.setdefault("health", {})   # Quelle -> Fehlerzähler
     state.setdefault("apple_status", {})  # Store|MPN -> zuletzt beobachtet verfügbar (bool)
     state.setdefault("restock_log", [])   # [{ts, store, city, mpn, event: "in"/"out"}]
     state.setdefault("last_digest", "")   # Datum (YYYY-MM-DD) der letzten Tagesmeldung
-    # Altbestand vor Einführung mehrerer Varianten gehört zu 256 GB (verhindert doppelte Alarme)
-    for channel in ("geizhals", "billiger"):
-        if channel in state["active"]:
-            state["active"].setdefault(f"{channel}_256", state["active"].pop(channel))
     return state
 
 
@@ -434,247 +424,6 @@ def send_morning_report(state):
         state["last_morning"] = today
 
 
-# ---------------- Geizhals ----------------
-
-def check_geizhals_shops(state):
-    """Prüft deutsche Online-Shops via Geizhals für jede Variante."""
-    for variant in VARIANTS:
-        check_geizhals_variant(state, variant)
-
-
-def check_geizhals_variant(state, variant):
-    """Alarm bei neuem Bestand oder Preissenkung je Shop."""
-    url = variant["geizhals"]
-    source = f"Geizhals {variant['storage']} GB"
-    min_p, max_p = variant["min_price"], variant["max_price"]
-    try:
-        r = fetch(url)
-    except Exception as e:
-        record_health(state, source, False, str(e))
-        return
-    if r.status_code != 200:
-        record_health(state, source, False, f"HTTP {r.status_code}")
-        return
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    offers = soup.select(".offer")
-    if not offers:
-        record_health(state, source, False, "Keine Angebote geparst")
-        return
-    record_health(state, source, True)
-
-    current = {}
-    for offer in offers:
-        shop_elem = offer.select_one(".merchant__logo-caption") or offer.select_one(".offer__merchant")
-        price_elem = offer.select_one(".gh_price")
-        avail_elem = offer.select_one(".offer__delivery-time")
-        link_elem = offer.select_one("a.offer__clickout")
-
-        if not (shop_elem and price_elem and avail_elem):
-            continue
-
-        shop = shop_elem.get_text(strip=True)
-        price = parse_price(price_elem.get_text(strip=True))
-        avail_display = avail_elem.get_text(" ", strip=True)
-        avail_text = avail_display.lower()
-        link = "https://geizhals.de" + link_elem["href"] if link_elem and link_elem.get("href") else url
-
-        is_in_stock = any(k in avail_text for k in ["lagernd", "sofort", "1-2 werktage", "1-3 werktage", "2-3 werktage", "auf lager"])
-        is_delayed = any(b in avail_text for b in ["wochen", "monat", "2027", "unbestimmt", "vorbestell"])
-
-        if price and min_p <= price <= max_p and is_in_stock and not is_delayed:
-            if shop not in current or price < current[shop]["price"]:
-                current[shop] = {"price": price, "avail": avail_display, "link": link}
-
-    active = state["active"].setdefault(f"geizhals_{variant['storage']}", {})
-    for shop, info in current.items():
-        prev_price = active.get(shop)
-        if prev_price is not None and info["price"] >= prev_price:
-            active[shop] = info["price"]
-            continue
-        headline = "PREIS GESUNKEN" if prev_price is not None else "SHOP-BESTAND GEFUNDEN"
-        msg = (
-            f"🛒 <b>{headline}: {esc(shop)}</b>\n"
-            f"Modell: <b>{esc(variant['label'])}</b>\n"
-            f"Preis: <b>{info['price']:.2f} €</b>\n"
-            f"Status: {esc(info['avail'])}\n"
-            f"👉 <a href='{esc(info['link'])}'>Direkt zum Shop</a>"
-        )
-        if send_telegram(msg):
-            active[shop] = info["price"]
-
-    for shop in list(active):
-        if shop not in current:
-            del active[shop]
-
-
-# ---------------- billiger.de ----------------
-
-BILLIGER_BASE_URL = "https://www.billiger.de/baseproducts/120571-apple-iphone-duo"
-
-
-def billiger_url(state, variant):
-    """Produktseite der Variante: fest konfiguriert oder einmalig aus der Übersichtsseite ermittelt."""
-    if variant["billiger"]:
-        return variant["billiger"]
-    cache = state.setdefault("billiger_urls", {})
-    if cache.get(variant["storage"]):
-        return cache[variant["storage"]]
-    r = fetch(BILLIGER_BASE_URL)
-    if r.status_code != 200:
-        raise RuntimeError(f"Übersichtsseite HTTP {r.status_code}")
-    m = re.search(rf"/products/\d+-apple-iphone-duo-{variant['storage']}-gb-sternenweiss\b", r.text)
-    if not m:
-        raise RuntimeError("Produktseite in der Übersicht nicht gefunden")
-    cache[variant["storage"]] = "https://www.billiger.de" + m.group(0)
-    print(f"  billiger.de {variant['storage']} GB: {cache[variant['storage']]}")
-    return cache[variant["storage"]]
-
-
-def billiger_in_stock(delivery):
-    """True nur bei eindeutig kurzfristiger Lieferbarkeit (sofort, Lager oder max. 5 Werktage)."""
-    d = delivery.lower()
-    if not d or any(b in d for b in ["woche", "monat", "unbestimmt", "vorbestell", "nicht lieferbar",
-                                     "ausverkauft", "anfang", "mitte", "ende", "2027"]):
-        return False
-    if any(k in d for k in ["sofort", "auf lager", "lagernd", "vorrätig"]):
-        return True
-    m = re.search(r"(\d+)\s*(?:-\s*(\d+))?\s*werktag", d)
-    return bool(m) and int(m.group(2) or m.group(1)) <= 5
-
-
-def check_billiger(state):
-    """Prüft billiger.de für jede Variante."""
-    for variant in VARIANTS:
-        check_billiger_variant(state, variant)
-
-
-def check_billiger_variant(state, variant):
-    """Prüft die Angebotszeilen auf billiger.de. Alarm nur bei Preis im Rahmen UND kurzfristiger Lieferzeit
-    (neuer Shop oder Preissenkung)."""
-    source = f"billiger.de {variant['storage']} GB"
-    min_p, max_p = variant["min_price"], variant["max_price"]
-    try:
-        url = billiger_url(state, variant)
-        r = fetch(url)
-    except Exception as e:
-        record_health(state, source, False, str(e))
-        return
-    if r.status_code != 200:
-        record_health(state, source, False, f"HTTP {r.status_code}")
-        return
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    rows = soup.select("[data-offer-row]")
-    if not rows:
-        record_health(state, source, False, "Keine Angebotszeilen (data-offer-row) gefunden")
-        return
-    record_health(state, source, True)
-
-    current = {}
-    for row in rows:
-        text = row.get_text(" | ", strip=True)
-        m = re.search(r"Verkäufer:\s*\|?\s*([^|]+)", text) or re.search(r"€ bei ([^|]+)", text)
-        if m:
-            seller = m.group(1).strip()
-        else:
-            logo = row.select_one("img[alt]")
-            alt = re.sub(r"^Shop\s+", "", logo["alt"].strip()) if logo else ""
-            seller = alt or f"Shop {row.get('data-shop-id', '?')}"
-        prices = [parse_price(p) for p in re.findall(r"(\d{1,3}(?:\.\d{3})*,\d{2})\s*€", text)]
-        price = next((p for p in prices if p and p >= 100), None)  # Versandkosten überspringen
-        dm = re.search(r"Lieferzeit:\s*\|?\s*([^|]+)", text)
-        delivery = dm.group(1).strip() if dm else ""
-        stock = billiger_in_stock(delivery)
-        print(f"  billiger.de {variant['storage']} GB: {seller} | {price} € | {delivery or 'keine Lieferzeit'} | "
-              f"{'lieferbar' if stock else 'nicht lieferbar'}")
-        if price and min_p <= price <= max_p and stock:
-            if seller not in current or price < current[seller]["price"]:
-                current[seller] = {"price": price, "delivery": delivery}
-
-    active = state["active"].setdefault(f"billiger_{variant['storage']}", {})
-    for seller, info in current.items():
-        prev = active.get(seller)
-        if prev is not None and info["price"] >= prev:
-            active[seller] = info["price"]
-            continue
-        headline = "PREIS GESUNKEN" if prev is not None else "LIEFERBAR"
-        msg = (
-            f"💶 <b>BILLIGER.DE – {headline}: {esc(seller)}</b>\n"
-            f"Modell: <b>{esc(variant['label'])}</b>\n"
-            f"Preis: <b>{info['price']:.2f} €</b>\n"
-            f"Lieferzeit: <b>{esc(info['delivery'])}</b>\n"
-            f"👉 <a href='{esc(url)}'>Zu billiger.de</a>"
-        )
-        if send_telegram(msg):
-            active[seller] = info["price"]
-
-    for seller in list(active):
-        if seller not in current:
-            del active[seller]
-
-
-# ---------------- Kleinanzeigen ----------------
-
-def check_kleinanzeigen(state):
-    """Prüft Kleinanzeigen.de für jede Variante."""
-    for variant in VARIANTS:
-        check_kleinanzeigen_variant(state, variant)
-
-
-def check_kleinanzeigen_variant(state, variant):
-    """Neue Inserate im Preisrahmen der Variante."""
-    source = f"Kleinanzeigen {variant['storage']} GB"
-    min_p, max_p = variant["min_price"], variant["max_price"]
-    url = f"https://www.kleinanzeigen.de/s-preis:{int(min_p)}:{int(max_p)}/iphone-duo-{variant['storage']}/k0"
-    try:
-        r = fetch(url)
-    except Exception as e:
-        record_health(state, source, False, str(e))
-        return
-    if r.status_code != 200:
-        record_health(state, source, False, f"HTTP {r.status_code}")
-        return
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    articles = soup.select("article.aditem")
-    structure_ok = bool(articles) or soup.select_one("#srchrslt-content, #srchrslt-adtable") is not None
-    if not structure_ok:
-        record_health(state, source, False, "Ergebnisliste nicht gefunden")
-        return
-    record_health(state, source, True)
-
-    for art in articles:
-        ad_id = art.get("data-adid")
-        title_elem = art.select_one(".text-module-begin a")
-        price_elem = art.select_one(".aditem-main--middle--price-shipping--price")
-        loc_elem = art.select_one(".aditem-main--top--left")
-
-        if not (ad_id and title_elem and price_elem):
-            continue
-
-        title = title_elem.get_text(strip=True)
-        if not title_ok(title, variant):
-            continue
-
-        price = parse_price(price_elem.get_text(strip=True))
-        if not price or not (min_p <= price <= max_p):
-            continue
-
-        link = "https://www.kleinanzeigen.de" + title_elem["href"]
-        location = loc_elem.get_text(" ", strip=True) if loc_elem else "Unbekannt"
-
-        msg = (
-            f"📦 <b>KLEINANZEIGEN-TREFFER {variant['storage']} GB (≤ {max_p:.0f} €)</b>\n"
-            f"Titel: {esc(title)}\n"
-            f"Preis: <b>{price:.2f} €</b>\n"
-            f"Ort: {esc(location)}\n"
-            f"⚠️ <i>Hinweis: Nur Abholung mit Original-Rechnung!</i>\n"
-            f"👉 <a href='{esc(link)}'>Zur Anzeige</a>"
-        )
-        alert_once(state, f"ka_{ad_id}", msg)
-
-
 # ---------------- eBay ----------------
 
 def _first(item, selectors):
@@ -795,8 +544,7 @@ if __name__ == "__main__":
     try:
         # Apple-Check über GitHub Actions (Alternative: local/apple_check.py – nie beide parallel betreiben)
         # eBay läuft lokal (local/ebay_check.py): eBay blockt GitHub-IPs mit HTTP 403
-        for check in (check_apple_store_pickup, send_morning_report, send_daily_restock_digest,
-                      check_geizhals_shops, check_billiger, check_kleinanzeigen):
+        for check in (check_apple_store_pickup, send_morning_report, send_daily_restock_digest):
             try:
                 check(state)
             except Exception as e:
