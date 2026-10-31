@@ -48,7 +48,7 @@ STATE_FILE = "state.json"
 LEGACY_SEEN_FILE = "seen_offers.json"   # wird beim ersten Lauf einmalig übernommen
 SEEN_RETENTION_DAYS = 30
 
-HEALTH_FAIL_THRESHOLD = 6               # Fehlläufe in Folge bis zur Warnung (= 30 Min bei 5-Min-Takt)
+HEALTH_FAIL_THRESHOLD = 15              # Fehlläufe in Folge bis zur Warnung (= 30 Min bei 2-Min-Takt)
 HEALTH_WARN_INTERVAL = 24 * 3600        # max. eine Warnung pro Quelle und Tag
 
 HEADERS = {
@@ -352,7 +352,7 @@ def send_daily_restock_digest(state):
                 lines.append("• ganztägig verfügbar")
             else:
                 lines.append(f"• seit Vortag verfügbar, bis {_hm(end)} Uhr")
-    lines.append("\n<i>Zeiten auf ±5 Min genau (Prüftakt).</i>")
+    lines.append("\n<i>Zeiten auf ±2 Min genau (Prüftakt).</i>")
 
     if send_telegram("\n".join(lines)):
         state["last_digest"] = today
@@ -400,7 +400,7 @@ def send_morning_report(state):
         usual = f"meist gegen {max(set(hours), key=hours.count):02d}:00 · " if len(hours) >= 2 else ""
         lines.append(f"• {usual}diese Woche {len(runs_week)}-mal aufgefüllt")
     n_variants = len({k.split("|", 1)[1] for k in state["apple_status"]})
-    lines.append(f"\n⭐ = Sternenweiß 256 GB dabei · {n_variants} Varianten erfasst · <i>Zeiten ±5 Min.</i>")
+    lines.append(f"\n⭐ = Sternenweiß 256 GB dabei · {n_variants} Varianten erfasst · <i>Zeiten ±2 Min.</i>")
 
     if send_telegram("\n".join(lines)):
         state["last_morning"] = today

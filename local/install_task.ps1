@@ -1,4 +1,4 @@
-# Legt die Windows-Aufgabe "iPhone Duo eBay-Check" an: alle 5 Minuten, nur aktueller Benutzer, ohne Admin.
+# Legt die Windows-Aufgabe "iPhone Duo eBay-Check" an: alle 2 Minuten, nur aktueller Benutzer, ohne Admin.
 # Aufruf im Ordner local:  powershell -ExecutionPolicy Bypass -File install_task.ps1
 # Entfernen:               Unregister-ScheduledTask -TaskName "iPhone Duo eBay-Check" -Confirm:$false
 
@@ -20,13 +20,13 @@ if (-not (Test-Path (Join-Path $PSScriptRoot "config.json"))) { throw "config.js
 
 $action   = New-ScheduledTaskAction -Execute $pyw -Argument "`"$Script`"" -WorkingDirectory $PSScriptRoot
 $trigger  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
-              -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
+              -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration (New-TimeSpan -Days 3650)
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
               -StartWhenAvailable -MultipleInstances IgnoreNew `
-              -ExecutionTimeLimit (New-TimeSpan -Minutes 3)
+              -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
     -Description "eBay-Angebote iPhone Duo 256 GB Sternenweiss (Sofort-Kaufen und Auktionen < 24h)" -Force | Out-Null
 
-Write-Host "Aufgabe '$TaskName' angelegt: alle 5 Minuten mit $pyw"
+Write-Host "Aufgabe '$TaskName' angelegt: alle 2 Minuten mit $pyw"
 Write-Host "State: $(Join-Path $PSScriptRoot 'ebay_state.json')"
