@@ -61,6 +61,8 @@ SEEN_RETENTION_DAYS = 30
 
 HEALTH_FAIL_THRESHOLD = 15              # Fehlläufe in Folge bis zur Warnung (= 30 Min bei 2-Min-Takt)
 HEALTH_WARN_INTERVAL = 24 * 3600        # max. eine Warnung pro Quelle und Tag
+# Für diese Quellen keine Telegram-Meldungen zu Fehlern/Wiederherstellung (nur Log-Ausgabe)
+HEALTH_SILENT_SOURCES = {"eBay", "eBay (lokal)"}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
@@ -136,14 +138,17 @@ def send_telegram(message):
 def record_health(state, source, ok, detail=""):
     h = state["health"].setdefault(source, {"fails": 0, "last_warn": 0})
     now = time.time()
+    silent = source in HEALTH_SILENT_SOURCES
     if ok:
-        if h["fails"] >= HEALTH_FAIL_THRESHOLD and h["last_warn"]:
+        if h["fails"] >= HEALTH_FAIL_THRESHOLD and h["last_warn"] and not silent:
             send_telegram(f"✅ <b>Tracker: {esc(source)} funktioniert wieder</b>")
         h["fails"] = 0
         h["last_warn"] = 0
         return
     h["fails"] += 1
     print(f"[{source}] Fehlschlag #{h['fails']}: {detail}")
+    if silent:
+        return
     if h["fails"] >= HEALTH_FAIL_THRESHOLD and now - h["last_warn"] >= HEALTH_WARN_INTERVAL:
         msg = (
             f"⚠️ <b>Tracker-Warnung: {esc(source)}</b>\n"
